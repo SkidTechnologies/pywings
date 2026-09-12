@@ -129,6 +129,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             data_directory=app.config["DATA_DIRECTORY"],
             remote_client=remote_client,
             store=app.extensions["server_store"],
+            activity_manager=activity_manager,
         )
         sftp_server.start()
         app.extensions["sftp_server"] = sftp_server

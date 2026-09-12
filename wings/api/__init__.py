@@ -262,9 +262,53 @@ def cancel_remote_download(server_uuid: str, download_id: str):
 @api.route("/api/system", methods=["GET", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def system_information():
-    """Return Wings system information, with an optional runtime v2 view."""
+    """Return Wings system information, matching official Wings system.GetSystemInformation."""
     if request.method == "OPTIONS":
         return "", 204
+
+    if request.args.get("v") == "2":
+        runtime = current_app.extensions["process_manager"].runtime
+        runtime_ver = "proot-5.1.0"
+        try:
+            res = runtime.version()
+            runtime_ver = res.stdout.strip() or res.stderr.strip() or "proot-5.1.0"
+        except Exception:
+            pass
+
+        all_servers = _server_store().all()
+        total_servers = len(all_servers)
+        running_servers = sum(1 for s in all_servers if getattr(s, "state", "") == "running")
+        mem_bytes = 1024 * 1024 * 1024
+        try:
+            if hasattr(os, "sysconf") and hasattr(os, "sysconf_names") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
+                mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except Exception:
+            pass
+
+        return jsonify({
+            "version": current_app.config["VERSION"],
+            "docker": {
+                "version": runtime_ver,
+                "cgroups": {"driver": "none", "version": "rootless"},
+                "containers": {
+                    "total": total_servers,
+                    "running": running_servers,
+                    "paused": 0,
+                    "stopped": max(0, total_servers - running_servers),
+                },
+                "storage": {"driver": "rootfs", "filesystem": "ext4"},
+                "runc": {"version": runtime_ver},
+            },
+            "system": {
+                "architecture": platform.machine(),
+                "cpu_threads": os.cpu_count() or 1,
+                "memory_bytes": mem_bytes,
+                "kernel_version": platform.release(),
+                "os": platform.platform(),
+                "os_type": platform.system().lower(),
+            },
+        })
+
     response = {
         "architecture": platform.machine(),
         "cpu_count": os.cpu_count() or 1,
@@ -272,17 +316,6 @@ def system_information():
         "os": platform.platform(),
         "version": current_app.config["VERSION"],
     }
-    if request.args.get("v") == "2":
-        runtime = current_app.extensions["process_manager"].runtime
-        runtime_info = {"available": True}
-        try:
-            result = runtime.version()
-            runtime_info["version"] = result.stdout.strip() or result.stderr.strip()
-        except RuntimeUnavailableError as error:
-            runtime_info = {"available": False, "error": str(error)}
-        response["runtime"] = runtime_info
-        response["data_directory"] = current_app.config["DATA_DIRECTORY"]
-        response["server_count"] = len(_server_store().all())
     return jsonify(response)
 
 

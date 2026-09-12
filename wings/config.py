@@ -35,10 +35,10 @@ def _get_version() -> str:
     v_file = PROJECT_ROOT / "version.txt"
     if v_file.is_file():
         try:
-            return v_file.read_text(encoding="utf-8").strip() or "1.0.21-pywings"
+            return v_file.read_text(encoding="utf-8").strip() or "1.0.22-pywings"
         except Exception:
             pass
-    return "1.0.21-pywings"
+    return "1.0.22-pywings"
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ class Settings:
     sftp_bind_address: str = "0.0.0.0"
     allowed_mounts: tuple[str, ...] = ()
     remote: str = ""
-    version: str = "1.0.21-pywings"
+    version: str = "1.0.22-pywings"
     config_path: Path = DEFAULT_CONFIG_PATH
     proot_path: str = ""
 

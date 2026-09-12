@@ -47,10 +47,36 @@ class PteroSFTPHandle(paramiko.SFTPHandle):
 
 
 class PteroSFTPInterface(paramiko.SFTPServerInterface):
-    def __init__(self, server_root: Path, permissions: list[str], server: Any = None) -> None:
+    def __init__(
+        self,
+        server_root: Path,
+        permissions: list[str],
+        server: Any = None,
+        server_uuid: str | None = None,
+        user_uuid: str | None = None,
+        client_ip: str = "127.0.0.1",
+        activity_manager: Any = None,
+    ) -> None:
         super().__init__(server)
         self.root = Path(server_root).resolve()
         self.permissions = set(permissions)
+        self.server_uuid = server_uuid
+        self.user_uuid = user_uuid
+        self.client_ip = client_ip
+        self.activity_manager = activity_manager
+
+    def _log_activity(self, event: str, metadata: dict | None = None) -> None:
+        if self.activity_manager and self.server_uuid:
+            try:
+                self.activity_manager.record(
+                    self.server_uuid,
+                    event,
+                    metadata=metadata,
+                    ip=self.client_ip,
+                    user=self.user_uuid,
+                )
+            except Exception:
+                pass
 
     def _resolve(self, path: str) -> Path:
         rel = path.lstrip("/\\")
@@ -129,6 +155,8 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
             if not target.exists() and ("w" in mode or "+" in mode):
                 target.touch()
             f = target.open(mode)
+            if "w" in mode or "+" in mode:
+                self._log_activity("server:sftp.write", {"file": path})
             return PteroSFTPHandle(flags, f)
         except FileNotFoundError:
             return paramiko.SFTP_NO_SUCH_FILE
@@ -143,6 +171,7 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
             if target == self.root:
                 return paramiko.SFTP_PERMISSION_DENIED
             target.unlink()
+            self._log_activity("server:sftp.delete", {"files": [path]})
             return paramiko.SFTP_OK
         except FileNotFoundError:
             return paramiko.SFTP_NO_SUCH_FILE
@@ -159,6 +188,7 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
                 return paramiko.SFTP_PERMISSION_DENIED
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.rename(dst)
+            self._log_activity("server:sftp.rename", {"from": oldpath, "to": newpath})
             return paramiko.SFTP_OK
         except FileNotFoundError:
             return paramiko.SFTP_NO_SUCH_FILE
@@ -171,6 +201,7 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
         try:
             target = self._resolve(path)
             target.mkdir(parents=True, exist_ok=True)
+            self._log_activity("server:sftp.create-directory", {"directory": path})
             return paramiko.SFTP_OK
         except OSError:
             return paramiko.SFTP_FAILURE
@@ -183,6 +214,7 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
             if target == self.root:
                 return paramiko.SFTP_PERMISSION_DENIED
             target.rmdir()
+            self._log_activity("server:sftp.delete", {"files": [path]})
             return paramiko.SFTP_OK
         except FileNotFoundError:
             return paramiko.SFTP_NO_SUCH_FILE
@@ -248,12 +280,14 @@ class SFTPServer:
         data_directory: Path | str,
         remote_client: PanelRemoteClient,
         store: ServerStore,
+        activity_manager: Any = None,
     ) -> None:
         self.host = host
         self.port = port
         self.data_directory = Path(data_directory).resolve()
         self.remote_client = remote_client
         self.store = store
+        self.activity_manager = activity_manager
         self.host_key = self._load_or_generate_key()
         self._running = False
         self._sock: socket.socket | None = None
@@ -309,6 +343,10 @@ class SFTPServer:
                 sftp_si=lambda: PteroSFTPInterface(
                     self.data_directory / ssh_server.auth_data["server"],
                     ssh_server.auth_data.get("permissions", []),
+                    server_uuid=ssh_server.auth_data.get("server"),
+                    user_uuid=ssh_server.auth_data.get("user"),
+                    client_ip=client_ip,
+                    activity_manager=self.activity_manager,
                 ),
             )
             ssh_server = PteroSSHServer(client_ip, self.remote_client, self.store)
