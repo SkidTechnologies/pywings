@@ -15,9 +15,14 @@ logger = logging.getLogger("wings.runtime.proot")
 class ProotDetector:
     """Discovers and validates the PRoot binary on the host."""
 
-    @staticmethod
-    def find_proot(configured_path: str | None = None) -> Path:
+    _cached_path: Path | None = None
+
+    @classmethod
+    def find_proot(cls, configured_path: str | None = None) -> Path:
         """Find an executable PRoot binary or raise a detailed error."""
+        if cls._cached_path and cls._cached_path.is_file() and os.access(cls._cached_path, os.X_OK):
+            return cls._cached_path
+
         candidates: list[str | Path | None] = [
             configured_path,
             os.environ.get("PROOT_PATH"),
@@ -44,8 +49,16 @@ class ProotDetector:
                         timeout=5,
                         check=False,
                     )
-                    # PRoot typically returns 0 or prints version info
-                    logger.info("Found PRoot binary at %s: %s", path, res.stdout.strip() or res.stderr.strip())
+                    out = (res.stdout or res.stderr or "").strip()
+                    # Find version number or first non-empty line
+                    ver_line = "found"
+                    for line in out.splitlines():
+                        line_s = line.strip()
+                        if line_s and not line_s.startswith("|") and not line_s.startswith("_"):
+                            ver_line = line_s
+                            break
+                    logger.info("Found PRoot binary at %s (%s)", path, ver_line)
+                    cls._cached_path = path
                     return path
                 except Exception as err:
                     logger.debug("PRoot candidate %s failed execution check: %s", path, err)

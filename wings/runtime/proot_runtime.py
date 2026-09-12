@@ -255,11 +255,8 @@ class ProotRuntime(ContainerRuntime):
             workdir=cont_cwd,
             volumes=vol_list,
         )
-        if not exec_args:
-            exec_args = ["/bin/sh", "-c", "while true; do sleep 3600; done"]
-        proot_cmd.extend(exec_args)
 
-        # 6. Environment variables
+        # 5. Environment variables
         # Start with a clean environment base, inject container image env, then server env
         proc_env: dict[str, str] = {
             "TERM": "xterm-256color",
@@ -291,7 +288,7 @@ class ProotRuntime(ContainerRuntime):
             " ".join(proot_cmd),
         )
 
-        # 7. Process creation with process group isolation (start_new_session=True)
+        # 6. Process creation with process group isolation (start_new_session=True)
         # Creating a new session/process group ensures that all child processes
         # (e.g. Java JVM, Node.js, bash workers) can be killed atomically when the server stops.
         return subprocess.Popen(
@@ -307,22 +304,44 @@ class ProotRuntime(ContainerRuntime):
         )
 
     @staticmethod
-    def terminate_process_tree(proc: subprocess.Popen, wait_seconds: int = 10) -> None:
+    def terminate_process_tree(proc_or_pid: Any, force: bool = False, wait_seconds: int = 10) -> None:
         """Atomically terminate the entire process group spawned by PRoot."""
-        if proc.poll() is not None:
+        if proc_or_pid is None:
             return
 
-        pid = proc.pid
-        logger.info("Terminating process tree for PID %d (process group)", pid)
+        proc: subprocess.Popen | None = None
+        if isinstance(proc_or_pid, subprocess.Popen):
+            if proc_or_pid.poll() is not None:
+                return
+            pid = proc_or_pid.pid
+            proc = proc_or_pid
+        elif isinstance(proc_or_pid, int):
+            pid = proc_or_pid
+        else:
+            return
 
-        # Attempt graceful termination of the whole process group
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
+        logger.info("Terminating process tree for PID %d (process group, force=%s)", pid, force)
+
+        # Attempt termination of the whole process group
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
             try:
-                proc.terminate()
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                if proc is not None:
+                    try:
+                        proc.kill() if force else proc.terminate()
+                    except OSError:
+                        pass
+        elif proc is not None:
+            try:
+                proc.kill() if force else proc.terminate()
             except OSError:
                 pass
+
+        if force or proc is None:
+            return
 
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
@@ -332,14 +351,14 @@ class ProotRuntime(ContainerRuntime):
 
         # Forceful kill if still running
         logger.warning("Process group for PID %d did not stop gracefully; sending SIGKILL", pid)
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
             try:
-                proc.kill()
-            except OSError:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
                 pass
         try:
+            proc.kill()
             proc.wait(timeout=2)
         except Exception:
             pass
