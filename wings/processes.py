@@ -829,23 +829,20 @@ class ProcessManager:
                     pass
 
             timeout = max(1, min(wait_seconds, 300))
-            try:
-                process.wait(timeout=timeout)
-            except Exception:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.5)
+
+            if process.poll() is None:
                 try:
                     if hasattr(self.runtime, "terminate_process_tree"):
-                        self.runtime.terminate_process_tree(process, force=False)
+                        self.runtime.terminate_process_tree(process, force=True)
                     else:
-                        process.terminate()
-                    process.wait(timeout=5)
+                        process.kill()
                 except Exception:
-                    try:
-                        if hasattr(self.runtime, "terminate_process_tree"):
-                            self.runtime.terminate_process_tree(process, force=True)
-                        else:
-                            process.kill()
-                    except Exception:
-                        pass
+                    pass
 
             with self._lock:
                 self._processes.pop(server_uuid, None)
@@ -854,65 +851,70 @@ class ProcessManager:
             self.set_server_state(server_uuid, STATE_OFFLINE)
 
     def kill(self, server_uuid: str) -> None:
-        lock = self._get_server_lock(server_uuid)
-        with lock:
-            with self._lock:
-                process = self._processes.get(server_uuid)
+        """Immediately and unconditionally kill all processes belonging to server_uuid without locking."""
+        with self._lock:
+            process = self._processes.pop(server_uuid, None)
+            self._started_at.pop(server_uuid, None)
 
-            pid = getattr(process, "pid", None)
-            server_root = (self.store.data_directory / server_uuid).resolve()
+        server_root = (self.store.data_directory / server_uuid).resolve()
+        pid = getattr(process, "pid", None)
 
-            # 1. Instant kill to process group directly
-            if pid and hasattr(os, "killpg"):
+        # 1. Instant kill to process group directly
+        if pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        # 2. Terminate entire process tree in runtime
+        if process is not None:
+            try:
+                if hasattr(self.runtime, "terminate_process_tree"):
+                    self.runtime.terminate_process_tree(process, force=True)
+                else:
+                    process.kill()
+            except OSError:
+                pass
+
+        # 3. Kill all lingering/orphaned child processes running from server directory, environ, or pgrp
+        if os.path.exists("/proc"):
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                p = int(entry)
+                if p <= 1 or p == os.getpid():
+                    continue
                 try:
-                    os.killpg(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                    is_target = False
+                    stat_text = Path(f"/proc/{p}/stat").read_text()
+                    rparen = stat_text.rfind(")")
+                    if rparen != -1:
+                        fields = stat_text[rparen + 1:].split()
+                        pgrp = int(fields[2])
+                        if pid and pgrp == pid:
+                            is_target = True
 
-            # 2. Terminate entire process tree in runtime
-            if process is not None:
-                try:
-                    if hasattr(self.runtime, "terminate_process_tree"):
-                        self.runtime.terminate_process_tree(process, force=True)
-                    else:
-                        process.kill()
-                except OSError:
-                    pass
-
-            # 3. Kill all lingering/orphaned child processes running from server directory or pgrp
-            if os.path.exists("/proc"):
-                for entry in os.listdir("/proc"):
-                    if not entry.isdigit():
-                        continue
-                    p = int(entry)
-                    if p <= 1:
-                        continue
-                    try:
-                        is_target = False
-                        stat_text = Path(f"/proc/{p}/stat").read_text()
-                        rparen = stat_text.rfind(")")
-                        if rparen != -1:
-                            fields = stat_text[rparen + 1:].split()
-                            pgrp = int(fields[2])
-                            if pid and pgrp == pid:
+                    if not is_target:
+                        env_file = Path(f"/proc/{p}/environ")
+                        if env_file.is_file():
+                            env_bytes = env_file.read_bytes()
+                            if f"SERVER_UUID={server_uuid}".encode() in env_bytes:
                                 is_target = True
 
-                        if not is_target:
-                            cwd_path = Path(f"/proc/{p}/cwd").resolve()
-                            if cwd_path == server_root or server_root in cwd_path.parents:
-                                is_target = True
+                    if not is_target:
+                        cwd_path = Path(f"/proc/{p}/cwd").resolve()
+                        if cwd_path == server_root or server_root in cwd_path.parents:
+                            is_target = True
 
-                        if is_target:
-                            logger.info("Instant killing process %d for server %s", p, server_uuid)
-                            os.kill(p, signal.SIGKILL)
-                    except (OSError, ValueError, IndexError):
-                        pass
+                    if is_target:
+                        logger.info("Instant killing process %d for server %s", p, server_uuid)
+                        os.kill(p, signal.SIGKILL)
+                except (OSError, ValueError, IndexError):
+                    pass
 
-            with self._lock:
-                self._processes.pop(server_uuid, None)
-                self._started_at.pop(server_uuid, None)
-
-            self.set_server_state(server_uuid, STATE_OFFLINE)
+        self.set_server_state(server_uuid, STATE_OFFLINE)
+        bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server process killed.")
+        bus.publish(server_uuid, ConsoleOutputEvent, "container@pterodactyl~ Server process killed.")
 
     def send_command(self, server_uuid: str, command: str) -> None:
         with self._lock:
