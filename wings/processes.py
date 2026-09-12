@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import tempfile
 from threading import Lock, RLock, Thread
 import time
 from typing import Any
@@ -308,12 +309,23 @@ class ProcessManager:
         ).start()
 
     def reinstall(self, server_uuid: str, configuration: dict) -> None:
-        self.stop(server_uuid, configuration)
-        try:
-            self.runtime.remove(server_uuid)
-        except (RuntimeCommandError, RuntimeUnavailableError):
-            pass
-        self.install(server_uuid, configuration, reinstall=True)
+        def _reinstall_worker() -> None:
+            self.stop(server_uuid, configuration)
+            try:
+                self.runtime.remove(server_uuid)
+            except (RuntimeCommandError, RuntimeUnavailableError):
+                pass
+            if self.remote_client:
+                try:
+                    fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                    if isinstance(fresh_conf, dict) and fresh_conf:
+                        configuration.update(fresh_conf)
+                        self.store.update_configuration(server_uuid, configuration)
+                except Exception as err:
+                    logger.warning("Could not sync server configuration before reinstall for %s: %s", server_uuid, err)
+            self._run_install(server_uuid, configuration, reinstall=True)
+
+        Thread(target=_reinstall_worker, daemon=True, name=f"reinstall-{server_uuid[:8]}").start()
 
     def _run_install(
         self,
@@ -330,7 +342,25 @@ class ProcessManager:
 
             server_root = (self.store.data_directory / server_uuid).resolve()
             server_root.mkdir(parents=True, exist_ok=True)
-            install_dir = server_root / ".install"
+
+            # If reinstalling, purge all previous server files except existing backups, matching user expectations
+            if reinstall:
+                logger.info("Reinstalling server %s: purging existing files in %s (keeping backups)", server_uuid, server_root)
+                for item in server_root.iterdir():
+                    if item.name in ("backups", ".tmp", ".shm"):
+                        continue
+                    try:
+                        if item.is_dir() and not item.is_symlink():
+                            shutil.rmtree(item, ignore_errors=True)
+                        else:
+                            item.unlink(missing_ok=True)
+                    except Exception as clean_err:
+                        logger.warning("Could not delete %s during reinstall: %s", item, clean_err)
+
+            # Match Wings Go implementation: use dedicated tmp directory outside server root
+            install_dir = Path(tempfile.gettempdir()) / "pywings-install" / server_uuid
+            if install_dir.exists():
+                shutil.rmtree(install_dir, ignore_errors=True)
             install_dir.mkdir(parents=True, exist_ok=True)
 
             # Try to fetch fresh installation script from Panel
@@ -342,9 +372,25 @@ class ProcessManager:
                 try:
                     script_data = self.remote_client.get_installation_script(server_uuid)
                     if isinstance(script_data, dict):
-                        script_text = script_data.get("script", "")
-                        container_image = script_data.get("container_image", "")
-                        entrypoint = script_data.get("entrypoint", "")
+                        raw_data = script_data.get("data") if isinstance(script_data.get("data"), dict) else script_data
+                        if isinstance(raw_data.get("attributes"), dict):
+                            raw_data = raw_data["attributes"]
+                        script_text = (
+                            raw_data.get("script")
+                            or raw_data.get("install_script")
+                            or raw_data.get("copy_script_install")
+                            or ""
+                        )
+                        container_image = (
+                            raw_data.get("container_image")
+                            or raw_data.get("copy_script_container")
+                            or ""
+                        )
+                        entrypoint = (
+                            raw_data.get("entrypoint")
+                            or raw_data.get("copy_script_entry")
+                            or ""
+                        )
                 except Exception as err:
                     logger.warning("Failed to fetch install script from panel for %s: %s", server_uuid, err)
 
@@ -352,11 +398,19 @@ class ProcessManager:
             if not script_text:
                 installation = configuration.get("installation") or {}
                 if isinstance(installation, dict):
-                    script_text = installation.get("script", "")
-                    container_image = container_image or installation.get("container_image", "")
-                    entrypoint = entrypoint or installation.get("entrypoint", "")
+                    script_text = installation.get("script") or installation.get("install_script") or ""
+                    container_image = container_image or installation.get("container_image") or ""
+                    entrypoint = entrypoint or installation.get("entrypoint") or ""
                 elif isinstance(installation, str):
                     script_text = installation
+
+            # Also check egg configuration
+            if not script_text:
+                egg_conf = configuration.get("egg") or {}
+                if isinstance(egg_conf, dict):
+                    script_text = egg_conf.get("script") or egg_conf.get("copy_script_install") or ""
+                    container_image = container_image or egg_conf.get("copy_script_container") or ""
+                    entrypoint = entrypoint or egg_conf.get("copy_script_entry") or ""
 
             if not container_image:
                 container_image = (
@@ -364,6 +418,14 @@ class ProcessManager:
                     or configuration.get("image")
                     or "ghcr.io/pterodactyl/installers:alpine"
                 )
+
+            logger.info(
+                "Installer parameters for %s: container_image=%s, entrypoint=%s, script_length=%d",
+                server_uuid,
+                container_image,
+                entrypoint,
+                len(script_text or ""),
+            )
 
             # Ensure configuration has all egg settings, environment variables, and image from Panel
             if self.remote_client:
@@ -417,11 +479,18 @@ class ProcessManager:
 
             install_cmd = (
                 f"export PATH=\"$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"; "
-                f"if command -v {shell_name} >/dev/null 2>&1; then exec {shell_name} /mnt/install/install.sh; "
+                f"if [ -x \"/bin/{shell_name}\" ]; then exec \"/bin/{shell_name}\" /mnt/install/install.sh; "
+                f"elif [ -x \"/usr/bin/{shell_name}\" ]; then exec \"/usr/bin/{shell_name}\" /mnt/install/install.sh; "
+                f"elif command -v {shell_name} >/dev/null 2>&1; then exec {shell_name} /mnt/install/install.sh; "
                 f"elif command -v bash >/dev/null 2>&1; then exec bash /mnt/install/install.sh; "
                 f"elif command -v ash >/dev/null 2>&1; then exec ash /mnt/install/install.sh; "
                 f"elif [ -x /bin/bash ]; then exec /bin/bash /mnt/install/install.sh; "
                 f"elif [ -x /usr/bin/bash ]; then exec /usr/bin/bash /mnt/install/install.sh; "
+                f"elif [ -x /bin/sh ]; then exec /bin/sh /mnt/install/install.sh; "
+                f"elif [ -x /usr/bin/sh ]; then exec /usr/bin/sh /mnt/install/install.sh; "
+                f"elif [ -x /bin/ash ]; then exec /bin/ash /mnt/install/install.sh; "
+                f"else exec sh /mnt/install/install.sh; fi"
+            )
                 f"elif [ -x /bin/sh ]; then exec /bin/sh /mnt/install/install.sh; "
                 f"elif [ -x /usr/bin/sh ]; then exec /usr/bin/sh /mnt/install/install.sh; "
                 f"elif [ -x /bin/ash ]; then exec /bin/ash /mnt/install/install.sh; "
@@ -602,6 +671,12 @@ class ProcessManager:
         limits = ProcessManager._limits(configuration)
         environment.setdefault("SERVER_MEMORY", str(limits.get("memory", 1024)))
         environment.setdefault("SERVER_IP", "0.0.0.0")
+        invocation = configuration.get("invocation") or configuration.get("startup") or ""
+        if not invocation:
+            proc_conf = configuration.get("process_configuration") or {}
+            invocation = proc_conf.get("startup", "")
+        environment.setdefault("STARTUP", str(invocation))
+        environment.setdefault("TZ", "UTC")
         return environment
 
     @staticmethod
