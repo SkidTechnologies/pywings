@@ -19,7 +19,7 @@ logger = logging.getLogger("wings.updater")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = PROJECT_ROOT / "version.txt"
-DEFAULT_VERSION = "1.0.10-pywings"
+DEFAULT_VERSION = "1.0.11-pywings"
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/SkidTechnologies/pywings/main/version.txt"
 REMOTE_ARCHIVE_URL = "https://github.com/SkidTechnologies/pywings/archive/refs/heads/main.zip"
 
@@ -285,6 +285,16 @@ class AutoUpdater:
                     self.app.extensions["sftp_server"].stop()
                 except Exception:
                     pass
+
+            # Close all inherited socket file descriptors (except stdin 0, stdout 1, stderr 2)
+            try:
+                import resource
+                max_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+                if max_fd == resource.RLIM_INFINITY:
+                    max_fd = 1024
+                os.closerange(3, min(max_fd, 4096))
+            except Exception:
+                pass
 
             time.sleep(1)
 

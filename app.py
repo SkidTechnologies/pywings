@@ -50,4 +50,24 @@ except (ValueError, AttributeError):
 
 
 if __name__ == "__main__":
-    app.run(host=app.config["HOST"], port=app.config["PORT"])
+    import socket
+    import time
+
+    host = str(app.config["HOST"])
+    port = int(app.config["PORT"])
+
+    # Wait if port is temporarily in TIME_WAIT from updater relaunch
+    for attempt in range(20):
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            test_sock.bind((host, port))
+            test_sock.close()
+            break
+        except OSError:
+            test_sock.close()
+            if attempt == 0:
+                print(f"[INFO] [server] Port {port} is releasing from updater relaunch; waiting...", flush=True)
+            time.sleep(0.5)
+
+    app.run(host=host, port=port)
