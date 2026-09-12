@@ -96,6 +96,22 @@ class PyDockerRuntime:
         except Exception as err:
             logger.debug("Could not initialize shims: %s", err)
 
+    def _find_proot(self) -> str | None:
+        """Find PRoot binary for container rootfs jail sandboxing."""
+        candidates = [
+            "/home/container/.tools/proot",
+            shutil.which("proot"),
+            "/usr/bin/proot",
+            "/usr/local/bin/proot",
+            str(Path.home() / ".udocker/bin/proot"),
+            str(Path.home() / ".udocker/bin/proot-x86_64-4_8_0"),
+            str(self.pydocker_dir / "bin/proot"),
+        ]
+        for cand in candidates:
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        return None
+
     def version(self) -> CommandResult:
         return CommandResult(
             command=("pydocker", "version"),
@@ -344,15 +360,45 @@ class PyDockerRuntime:
         resolved_cmd = self._resolve_command(command, vol_map, host_workdir, rootfs)
 
         is_installer = "_installer" in container
-        logger.info(
-            "[pydocker] Launching %s (workdir=%s): %s",
-            container,
-            host_workdir,
-            " ".join(resolved_cmd) if isinstance(resolved_cmd, list) else str(resolved_cmd),
-        )
+
+        # Check for PRoot sandboxed filesystem jail to isolate from host (prevent reverse shell/escape)
+        proot_bin = self._find_proot()
+        use_proot = proot_bin is not None and (rootfs / "bin").exists() and not is_installer
+
+        if use_proot:
+            cont_w = workdir or "/home/container"
+            jail_cmd = [
+                proot_bin,
+                "-0",
+                "-r", str(rootfs),
+                "-w", cont_w,
+            ]
+            for sys_dir in ("/dev", "/proc", "/sys"):
+                if os.path.exists(sys_dir):
+                    jail_cmd.extend(["-b", sys_dir])
+            for cont_p, host_p in vol_map.items():
+                jail_cmd.extend(["-b", f"{host_p}:{cont_p}"])
+            jail_cmd.extend(command)
+            proc_cmd = jail_cmd
+            proc_env["PROOT_NO_SECCOMP"] = "1"
+            proc_env["PROOT_NO_SUBRECONF"] = "1"
+            logger.info(
+                "[pydocker] Sandboxed PRoot jail launching %s (jail_root=%s): %s",
+                container,
+                rootfs,
+                " ".join(proc_cmd) if isinstance(proc_cmd, list) else str(proc_cmd),
+            )
+        else:
+            proc_cmd = resolved_cmd
+            logger.info(
+                "[pydocker] Launching %s (workdir=%s): %s",
+                container,
+                host_workdir,
+                " ".join(proc_cmd) if isinstance(proc_cmd, list) else str(proc_cmd),
+            )
 
         return subprocess.Popen(
-            resolved_cmd,
+            proc_cmd,
             cwd=str(host_workdir),
             env=proc_env,
             stdin=subprocess.DEVNULL if is_installer else subprocess.PIPE,
