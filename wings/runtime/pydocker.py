@@ -63,15 +63,36 @@ class PyDockerRuntime:
         """Create compatibility shims for egg scripts."""
         try:
             self.shims_dir.mkdir(parents=True, exist_ok=True)
+            # apk shim
             apk_shim = self.shims_dir / "apk"
-            if not apk_shim.exists():
-                apk_shim.write_text(
-                    "#!/bin/sh\n"
-                    "# Compatibility shim for Alpine egg installer scripts\n"
-                    "exit 0\n",
-                    encoding="utf-8",
-                )
-                apk_shim.chmod(0o755)
+            apk_shim.write_text(
+                "#!/bin/sh\n"
+                "# Compatibility shim for Alpine egg installer scripts\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            apk_shim.chmod(0o755)
+
+            # apt and apt-get shims
+            apt_script = (
+                "#!/bin/sh\n"
+                "if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then\n"
+                "    exit 0\n"
+                "fi\n"
+                "if [ -x /usr/bin/apt-get ]; then\n"
+                '    exec /usr/bin/apt-get "$@" 2>/dev/null || exit 0\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            for name in ("apt", "apt-get"):
+                s = self.shims_dir / name
+                s.write_text(apt_script, encoding="utf-8")
+                s.chmod(0o755)
+
+            # sudo shim
+            sudo_shim = self.shims_dir / "sudo"
+            sudo_shim.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+            sudo_shim.chmod(0o755)
         except Exception as err:
             logger.debug("Could not initialize shims: %s", err)
 
@@ -277,7 +298,7 @@ class PyDockerRuntime:
         proc_env["TERM"] = "xterm-256color"
         proc_env["PYTHONUNBUFFERED"] = "1"
 
-        # Build PATH including container rootfs binaries and shims
+        # Build PATH ensuring rootfs, shims, egg environment, and system binaries are present
         path_dirs = []
         if rootfs.exists():
             for p in ("bin", "usr/bin", "usr/local/bin", "opt/java/openjdk/bin"):
@@ -286,7 +307,31 @@ class PyDockerRuntime:
                     path_dirs.append(str(cand))
 
         path_dirs.append(str(self.shims_dir))
-        path_dirs.append(proc_env.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+
+        egg_path = (environment or {}).get("PATH", "")
+        if egg_path:
+            for ep in egg_path.split(":"):
+                if ep and ep not in path_dirs:
+                    path_dirs.append(ep)
+
+        # Standard Linux paths must be present for curl, jq, tar, tr, sort, tail
+        for std in (
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/local/sbin",
+            "/usr/sbin",
+            "/sbin",
+        ):
+            if std not in path_dirs:
+                path_dirs.append(std)
+
+        host_path = os.environ.get("PATH", "")
+        if host_path:
+            for hp in host_path.split(":"):
+                if hp and hp not in path_dirs:
+                    path_dirs.append(hp)
+
         proc_env["PATH"] = ":".join(path_dirs)
 
         # Set JAVA_HOME if available in rootfs
