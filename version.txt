@@ -1,1 +1,1 @@
-1.0.7-pywings
+1.0.8-pywings

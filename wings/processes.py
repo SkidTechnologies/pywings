@@ -678,6 +678,22 @@ class ProcessManager:
             if not allowed:
                 raise ValueError(f"mount source is not allowed: {source_path}")
             volumes.append(f"{source_path}:{target}")
+
+        # Ensure per-server private .tmp and .shm mounts to isolate servers and prevent conflicts
+        server_tmp = server_root / ".tmp"
+        server_shm = server_root / ".shm"
+        server_tmp.mkdir(parents=True, exist_ok=True)
+        server_shm.mkdir(parents=True, exist_ok=True)
+        try:
+            server_tmp.chmod(0o1777)
+            server_shm.chmod(0o1777)
+        except OSError:
+            pass
+        if "/tmp" not in targets:
+            volumes.append(f"{server_tmp}:/tmp")
+        if "/dev/shm" not in targets:
+            volumes.append(f"{server_shm}:/dev/shm")
+
         return volumes
 
     @staticmethod
@@ -1076,15 +1092,25 @@ class ProcessManager:
         if not root.exists():
             return 0
         total = 0
-        try:
-            for path in root.rglob("*"):
-                if path.is_file():
-                    try:
-                        total += path.stat().st_size
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        dirs_to_visit = [str(root)]
+        while dirs_to_visit:
+            curr = dirs_to_visit.pop()
+            try:
+                with os.scandir(curr) as it:
+                    for entry in it:
+                        try:
+                            # Skip internal temp, shm, and install directories from disk usage quota
+                            if entry.name in (".tmp", ".shm", ".install"):
+                                continue
+                            if entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                            elif entry.is_dir(follow_symlinks=False):
+                                dirs_to_visit.append(entry.path)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+
         self._disk_cache[server_uuid] = (now, total)
         return total
 
