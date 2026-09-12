@@ -230,7 +230,14 @@ class PanelRemoteClient:
 
     def set_transfer_status(self, server_uuid: str, successful: bool) -> None:
         """Notify the Panel of transfer status."""
-        self._request("POST", f"/servers/{server_uuid}/transfer", data={"successful": bool(successful)})
+        state = "success" if successful else "failure"
+        try:
+            self._request("POST", f"/servers/{server_uuid}/transfer/{state}")
+        except Exception:
+            try:
+                self._request("POST", f"/servers/{server_uuid}/transfer", data={"successful": bool(successful)})
+            except Exception as err:
+                logger.warning("Failed to notify Panel of transfer status for %s: %s", server_uuid, err)
 
     def validate_sftp_credentials(
         self,

@@ -42,11 +42,23 @@ def create_app(settings: Settings | None = None) -> Flask:
     proot_custom_path = app.config.get("PROOT_PATH") or None
     runtime = ProotRuntime(data_directory=runtime_data_dir, proot_path=proot_custom_path)
     app.extensions["container_runtime"] = runtime
+
+    # Initialize activity event manager
+    activity_manager = None
+    try:
+        from wings.activity import ActivityManager
+        activity_manager = ActivityManager(remote_client=remote_client)
+        activity_manager.start()
+        app.extensions["activity_manager"] = activity_manager
+    except Exception as err:
+        logger.warning("Could not start activity manager: %s", err)
+
     app.extensions["process_manager"] = ProcessManager(
         app.extensions["server_store"],
         runtime,
         app.config["ALLOWED_MOUNTS"],
         remote_client=remote_client,
+        activity_manager=activity_manager,
     )
     sock = Sock(app)
 

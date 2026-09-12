@@ -177,24 +177,42 @@ class ServerFilesystem:
         destination = self.path(root)
         if not archive.is_file():
             raise FilesystemError("The requested resource was not found on the system.")
-        if tarfile.is_tarfile(archive):
-            with tarfile.open(archive) as source:
+
+        # Handle zip archives
+        if zipfile.is_zipfile(archive) or archive.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(archive) as source:
+                    for info in source.infolist():
+                        norm_name = info.filename.lstrip("/\\")
+                        target = (destination / norm_name).resolve()
+                        if target != self.root and self.root not in target.parents:
+                            raise FilesystemError("The archive contains a path outside the server root.")
+                        source.extract(info, destination)
+                        # Restore unix permissions if present in external_attr
+                        mode = (info.external_attr >> 16) & 0o777
+                        if mode and target.exists():
+                            try:
+                                target.chmod(mode)
+                            except OSError:
+                                pass
+                return
+            except zipfile.BadZipFile:
+                pass
+
+        # Handle tar archives (.tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz)
+        try:
+            with tarfile.open(archive, mode="r:*") as source:
                 for member in source.getmembers():
-                    if member.issym() or member.islnk():
-                        raise FilesystemError("The archive contains unsupported symbolic or hard links.")
-                    target = (destination / member.name).resolve()
+                    norm_name = member.name.lstrip("/\\")
+                    target = (destination / norm_name).resolve()
                     if target != self.root and self.root not in target.parents:
                         raise FilesystemError("The archive contains a path outside the server root.")
                 source.extractall(destination)
-        elif zipfile.is_zipfile(archive):
-            with zipfile.ZipFile(archive) as source:
-                for member in source.namelist():
-                    target = (destination / member).resolve()
-                    if target != self.root and self.root not in target.parents:
-                        raise FilesystemError("The archive contains a path outside the server root.")
-                source.extractall(destination)
-        else:
-            raise FilesystemError("The archive provided is in a format Wings does not understand.")
+                return
+        except tarfile.TarError:
+            pass
+
+        raise FilesystemError("The archive provided is in a format Wings does not understand.")
 
     def create_backup(self, backup_id: str | None = None, name: str | None = None, ignore: str | None = None) -> dict:
         backup_id = backup_id or str(uuid.uuid4())

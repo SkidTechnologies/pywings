@@ -8,10 +8,15 @@ import sys
 os.environ["PROOT_NO_SECCOMP"] = "1"
 os.environ["GLIBC_TUNABLES"] = "glibc.pthread.rseq=0"
 
-# CLI Configuration Helper
+# CLI Helpers
 if "--configure" in sys.argv:
     from wings.configure import run_configure
     run_configure(sys.argv[1:])
+    sys.exit(0)
+
+if "--diagnostics" in sys.argv:
+    from wings.diagnostics import run_diagnostics
+    run_diagnostics(sys.argv[1:])
     sys.exit(0)
 
 # Check GitHub version.txt at launch and auto-upgrade if newer version exists

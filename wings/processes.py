@@ -71,11 +71,13 @@ class ProcessManager:
         runtime: ContainerRuntime,
         allowed_mounts=(),
         remote_client: PanelRemoteClient | None = None,
+        activity_manager: Any = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.allowed_mounts = tuple(Path(item).resolve() for item in allowed_mounts)
         self.remote_client = remote_client
+        self.activity_manager = activity_manager
         self._processes: dict[str, Any] = {}
         self._started_at: dict[str, float] = {}
         self._server_locks: dict[str, RLock] = {}
@@ -234,6 +236,8 @@ class ProcessManager:
                 self._net_baseline[server_uuid] = self._read_network_bytes()
 
             bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server process started.")
+            if self.activity_manager:
+                self.activity_manager.record(server_uuid, "server:power.start")
             Thread(target=self._watch, args=(server_uuid, process, configuration), daemon=True).start()
             Thread(
                 target=self._enforce_limits,
@@ -479,6 +483,8 @@ class ProcessManager:
 
             self.set_server_state(server_uuid, STATE_OFFLINE if successful else "install_failed")
             bus.publish(server_uuid, InstallCompletedEvent)
+            if self.activity_manager:
+                self.activity_manager.record(server_uuid, "server:install.complete", {"successful": successful})
             bus.publish(
                 server_uuid,
                 DaemonMessageEvent,
@@ -950,12 +956,17 @@ class ProcessManager:
                 self._started_at.pop(server_uuid, None)
 
             self.set_server_state(server_uuid, STATE_OFFLINE)
+            if self.activity_manager:
+                self.activity_manager.record(server_uuid, "server:power.stop")
 
     def kill(self, server_uuid: str) -> None:
         """Immediately and unconditionally kill all processes belonging to server_uuid without locking."""
         with self._lock:
             process = self._processes.pop(server_uuid, None)
             self._started_at.pop(server_uuid, None)
+
+        if self.activity_manager:
+            self.activity_manager.record(server_uuid, "server:power.kill")
 
         server_root = (self.store.data_directory / server_uuid).resolve()
         pid = getattr(process, "pid", None)

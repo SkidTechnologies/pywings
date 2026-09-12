@@ -313,16 +313,30 @@ def update_all_servers():
 
 
 @api.route("/api/transfers", methods=["POST", "OPTIONS"], provide_automatic_options=False)
-@require_authorization
 def receive_transfer():
+    """Receive and extract an incoming server transfer from another daemon."""
     if request.method == "OPTIONS":
         return "", 204
-    server_uuid = str(request.form.get("server_uuid", ""))
+
+    # Extract transfer token or form field
+    auth = request.headers.get("Authorization", "")
+    server_uuid = ""
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            claims = jwt.decode(token, options={"verify_signature": False})
+            server_uuid = str(claims.get("sub") or claims.get("server_uuid") or "")
+        except Exception:
+            pass
+
+    server_uuid = server_uuid or str(request.form.get("server_uuid", ""))
     if not valid_server_uuid(server_uuid):
         return jsonify({"error": "A valid server_uuid is required."}), 422
+
     upload = request.files.get("archive") or request.files.get("file")
     if upload is None:
         return jsonify({"error": "The transfer archive is required."}), 400
+
     server_root = Path(current_app.config["DATA_DIRECTORY"]) / server_uuid
     temporary = server_root / "backups" / f"incoming-{uuid.uuid4()}.tar.gz"
     temporary.parent.mkdir(parents=True, exist_ok=True)
@@ -330,10 +344,35 @@ def receive_transfer():
         upload.save(temporary)
         _server_store().ensure(server_uuid)
         filesystem = _filesystem(server_uuid)
-        # Restore performs member validation before extracting.
         filesystem.restore_backup(temporary.name[:-7])
+
+        # Refresh configuration from Panel and notify of transfer success
+        remote = current_app.extensions.get("remote_client")
+        if remote and current_app.config["PANEL_LOCATION"]:
+            try:
+                cfg = remote.get_server_configuration(server_uuid)
+                if isinstance(cfg, dict):
+                    _server_store().update_configuration(server_uuid, cfg)
+            except Exception as err:
+                logger.warning("Could not fetch configuration after transfer for %s: %s", server_uuid, err)
+
+            try:
+                remote.set_transfer_status(server_uuid, True)
+            except Exception as err:
+                logger.warning("Failed notifying Panel of transfer success for %s: %s", server_uuid, err)
+
+        bus.publish(server_uuid, "transfer status", "success")
+        logger.info("Successfully received and restored incoming transfer for server %s", server_uuid)
         return "", 202
     except (FilesystemError, OSError) as exc:
+        logger.error("Failed unpacking incoming transfer for %s: %s", server_uuid, exc)
+        remote = current_app.extensions.get("remote_client")
+        if remote and current_app.config["PANEL_LOCATION"]:
+            try:
+                remote.set_transfer_status(server_uuid, False)
+            except Exception:
+                pass
+        bus.publish(server_uuid, "transfer status", "failure")
         return jsonify({"error": str(exc)}), 400
     finally:
         temporary.unlink(missing_ok=True)
@@ -934,12 +973,12 @@ def server_transfer(server_uuid: str):
     with _transfers_lock:
         _transfers[server_uuid] = {"uuid": transfer_id, "status": "ready", "archive": archive["name"]}
     payload = request.get_json(silent=True) or {}
-    destination_url = str(payload.get("destination_url", ""))
-    transfer_token = str(payload.get("transfer_token", ""))
-    if destination_url:
+    destination_url = str(payload.get("url") or payload.get("destination_url", ""))
+    transfer_token = str(payload.get("token") or payload.get("transfer_token", ""))
+    if destination_url and transfer_token:
         parsed = urlparse(destination_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not transfer_token:
-            return jsonify({"error": "destination_url and transfer_token must be valid."}), 400
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return jsonify({"error": "destination_url must be a valid http or https URL."}), 400
         with _transfers_lock:
             _transfers[server_uuid]["status"] = "sending"
         Thread(
@@ -954,7 +993,7 @@ def _send_transfer_worker(server_uuid: str, transfer_id: str, destination_url: s
     archive = _filesystem(server_uuid).backup_path(transfer_id)
     parsed = urlparse(destination_url)
     connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    connection = connection_class(parsed.netloc, timeout=60)
+    connection = connection_class(parsed.netloc, timeout=300)
     boundary = f"----pywings-{uuid.uuid4().hex}"
     prefix = (
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"server_uuid\"\r\n\r\n"
@@ -980,10 +1019,19 @@ def _send_transfer_worker(server_uuid: str, transfer_id: str, destination_url: s
         if response.status < 200 or response.status >= 300:
             raise RuntimeError(f"destination returned HTTP {response.status}")
         status = "completed"
+        logger.info("Successfully pushed transfer archive for %s to %s", server_uuid, destination_url)
     except Exception as error:
         status = "failed"
+        logger.error("Failed sending server transfer for %s to %s: %s", server_uuid, destination_url, error)
         with _transfers_lock:
             _transfers[server_uuid]["error"] = str(error)
+        remote = current_app.extensions.get("remote_client")
+        if remote and current_app.config["PANEL_LOCATION"]:
+            try:
+                remote.set_transfer_status(server_uuid, False)
+            except Exception:
+                pass
+        bus.publish(server_uuid, "transfer status", "failure")
     finally:
         connection.close()
     with _transfers_lock:

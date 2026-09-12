@@ -19,7 +19,7 @@ logger = logging.getLogger("wings.updater")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = PROJECT_ROOT / "version.txt"
-DEFAULT_VERSION = "1.0.11-pywings"
+DEFAULT_VERSION = "1.0.12-pywings"
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/SkidTechnologies/pywings/main/version.txt"
 REMOTE_ARCHIVE_URL = "https://github.com/SkidTechnologies/pywings/archive/refs/heads/main.zip"
 
