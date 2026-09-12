@@ -80,6 +80,7 @@ class ProcessManager:
         self._server_locks: dict[str, RLock] = {}
         self._last_crash: dict[str, float] = {}
         self._cpu_history: dict[str, tuple[float, int]] = {}
+        self._cpu_cache: dict[str, tuple[float, float]] = {}
         self._disk_cache: dict[str, tuple[float, int]] = {}
         self._net_baseline: dict[str, tuple[int, int]] = {}
         self._last_net: dict[str, tuple[int, int]] = {}
@@ -1022,7 +1023,7 @@ class ProcessManager:
             "memory_limit_bytes": memory_limit,
             "cpu_absolute": cpu_absolute,
             "network": {"rx_bytes": rx_bytes, "tx_bytes": tx_bytes},
-            "uptime": max(0, int(time.monotonic() - (started_at or time.monotonic()))),
+            "uptime": max(0, int((time.monotonic() - (started_at or time.monotonic())) * 1000)),
             "state": current_state,
             "disk_bytes": self._disk_usage(server_uuid),
         }
@@ -1097,6 +1098,10 @@ class ProcessManager:
         if not pid or not os.path.exists("/proc"):
             return 0.0
         now = time.monotonic()
+        cached = self._cpu_cache.get(server_uuid)
+        if cached and (now - cached[0] < 0.8):
+            return cached[1]
+
         total_ticks = 0
         try:
             clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
@@ -1115,12 +1120,19 @@ class ProcessManager:
                 pass
 
         last = self._cpu_history.get(server_uuid)
-        self._cpu_history[server_uuid] = (now, total_ticks)
         if not last:
+            self._cpu_history[server_uuid] = (now, total_ticks)
+            self._cpu_cache[server_uuid] = (now, 0.0)
             return 0.0
 
         last_time, last_ticks = last
-        delta_time = max(0.1, now - last_time)
+        delta_time = now - last_time
+        if delta_time < 0.5:
+            return cached[1] if cached else 0.0
+
+        self._cpu_history[server_uuid] = (now, total_ticks)
         delta_ticks = max(0, total_ticks - last_ticks)
         cpu_usage = (delta_ticks / clock_ticks) / delta_time * 100.0
-        return round(cpu_usage, 2)
+        val = round(cpu_usage, 2)
+        self._cpu_cache[server_uuid] = (now, val)
+        return val
