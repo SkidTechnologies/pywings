@@ -400,10 +400,16 @@ def servers():
 
     # Fetch full server configuration from Panel if not provided in payload, matching Go Wings installer.New()
     configuration = payload.get("configuration")
-    if not isinstance(configuration, dict) or not configuration.get("container"):
+    has_image = isinstance(configuration, dict) and bool((configuration.get("container") or {}).get("image") or configuration.get("image"))
+    if not has_image:
         if current_app.config["PANEL_LOCATION"]:
             try:
-                configuration = current_app.extensions["remote_client"].get_server_configuration(server_uuid)
+                remote_cfg = current_app.extensions["remote_client"].get_server_configuration(server_uuid)
+                if isinstance(remote_cfg, dict):
+                    if not isinstance(configuration, dict):
+                        configuration = remote_cfg
+                    else:
+                        configuration.update(remote_cfg)
             except Exception as err:
                 logger.warning("Could not fetch full server configuration from Panel for %s: %s", server_uuid, err)
                 if not isinstance(configuration, dict):

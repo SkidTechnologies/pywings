@@ -158,6 +158,21 @@ class ProcessManager:
         self.set_server_state(server_uuid, STATE_STARTING)
         bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Preparing server environment for boot...")
 
+        # If configuration is missing container.image, fetch fresh config from Panel or store
+        if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
+            if self.remote_client:
+                try:
+                    fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                    if isinstance(fresh_conf, dict) and fresh_conf:
+                        configuration.update(fresh_conf)
+                        self.store.update_configuration(server_uuid, configuration)
+                except Exception as err:
+                    logger.warning("Could not refresh configuration from Panel for %s: %s", server_uuid, err)
+            if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
+                stored = self.store.get(server_uuid)
+                if stored and stored.configuration:
+                    configuration.update(stored.configuration)
+
         image = self.validate_configuration(configuration)
         environment = self._environment(configuration)
         self._apply_java_environment(image, environment)
@@ -297,11 +312,11 @@ class ProcessManager:
                     or "ghcr.io/pterodactyl/installers:alpine"
                 )
 
-            # Ensure configuration has all egg environment variables
-            if self.remote_client and (not configuration.get("environment") or len(configuration.get("environment", {})) <= 2):
+            # Ensure configuration has all egg settings, environment variables, and image from Panel
+            if self.remote_client:
                 try:
                     fresh_conf = self.remote_client.get_server_configuration(server_uuid)
-                    if isinstance(fresh_conf, dict):
+                    if isinstance(fresh_conf, dict) and fresh_conf:
                         configuration.update(fresh_conf)
                         self.store.update_configuration(server_uuid, configuration)
                 except Exception as err:
@@ -423,6 +438,19 @@ class ProcessManager:
 
             if start_on_completion and successful:
                 logger.info("Starting server %s after successful installation", server_uuid)
+                fresh_conf = None
+                if self.remote_client:
+                    try:
+                        fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                        if isinstance(fresh_conf, dict) and fresh_conf:
+                            configuration.update(fresh_conf)
+                            self.store.update_configuration(server_uuid, configuration)
+                    except Exception as err:
+                        logger.warning("Could not refresh configuration on start_on_completion for %s: %s", server_uuid, err)
+                if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
+                    stored = self.store.get(server_uuid)
+                    if stored and stored.configuration:
+                        configuration.update(stored.configuration)
                 self.start(server_uuid, configuration)
 
     def _notify_install_with_retries(self, server_uuid: str, successful: bool, reinstall: bool) -> None:
@@ -450,9 +478,17 @@ class ProcessManager:
     def validate_configuration(configuration: dict) -> str:
         if not isinstance(configuration, dict):
             raise ValueError("server configuration must be an object")
-        image = (configuration.get("container") or {}).get("image") or configuration.get("image")
+        image = (
+            (configuration.get("container") or {}).get("image")
+            or configuration.get("image")
+            or configuration.get("container_image")
+            or ((configuration.get("settings") or {}).get("container") or {}).get("image")
+            or (configuration.get("settings") or {}).get("image")
+            or (configuration.get("installation") or {}).get("container_image")
+        )
         if not isinstance(image, str) or not image.strip():
             raise ValueError("server configuration is missing container.image")
+        image = image.strip()
         limits = ProcessManager._limits(configuration)
         if not isinstance(limits, dict):
             raise ValueError("server configuration limits must be an object")
