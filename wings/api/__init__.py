@@ -12,8 +12,10 @@ import os
 from pathlib import Path
 import platform
 from queue import Empty
+import shutil
 from threading import Lock, Thread
 import time
+import urllib.request
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
@@ -28,6 +30,7 @@ from wings.events import (
     BackupRestoreCompletedEvent,
     BackupCompletedEvent,
 )
+from wings.processes import STATE_OFFLINE
 from wings.servers import ServerRecord, valid_server_uuid
 from wings.runtime import RuntimeCommandError, RuntimeUnavailableError
 from wings.remote import PanelRemoteError
