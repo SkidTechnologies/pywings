@@ -47,24 +47,44 @@ def get_local_version() -> str:
 
 
 def get_remote_version(timeout: int = 5) -> str | None:
-    """Fetch remote version from GitHub version.txt with cache busting."""
-    url = f"{REMOTE_VERSION_URL}?_t={int(time.time())}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "pywings-autoupdater/1.0",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-        },
-    )
+    """Fetch remote version from GitHub instantly using API with raw fallback."""
+    import base64
+
+    # 1. GitHub API (instantaneous, never delayed by CDN cache)
+    api_url = "https://api.github.com/repos/SkidTechnologies/pywings/contents/version.txt"
     try:
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": "pywings-autoupdater/1.0", "Accept": "application/vnd.github.v3+json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                if "content" in data:
+                    raw = base64.b64decode(data["content"]).decode("utf-8", errors="replace").strip()
+                    if raw:
+                        return raw
+    except Exception as err:
+        logger.debug("GitHub API version check failed (%s), trying raw URL", err)
+
+    # 2. Raw CDN fallback
+    url = f"{REMOTE_VERSION_URL}?_t={int(time.time())}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "pywings-autoupdater/1.0",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            },
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 content = resp.read().decode("utf-8", errors="replace").strip()
                 if content:
                     return content
-    except Exception as err:
-        logger.debug("Failed fetching remote version from %s: %s", url, err)
+    except Exception:
+        pass
+
     return None
 
 
