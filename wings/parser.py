@@ -108,6 +108,17 @@ class ConfigParser:
             file_path.write_text(updated, encoding="utf-8")
             logger.debug("Successfully updated configuration file: %s", file_path.name)
 
+    @staticmethod
+    def _matches_if_value(if_val: str, current_val: str) -> bool:
+        if not if_val:
+            return True
+        if if_val.startswith("regex:"):
+            try:
+                return bool(re.search(if_val[6:], current_val))
+            except re.error:
+                return False
+        return if_val.strip() == current_val.strip()
+
     def _update_properties(self, content: str, replacements: list[dict]) -> str:
         lines = content.splitlines()
         props: dict[str, int] = {}
@@ -119,10 +130,17 @@ class ConfigParser:
 
         for rep in replacements:
             match_key = rep.get("match", "")
+            if_val = rep.get("if_value", "")
             replace_with = self.resolve_value(rep.get("replace_with", rep.get("value", "")))
             if match_key in props:
+                curr_line = lines[props[match_key]]
+                curr_val = curr_line.split("=", 1)[1].strip() if "=" in curr_line else ""
+                if if_val and not self._matches_if_value(if_val, curr_val):
+                    continue
                 lines[props[match_key]] = f"{match_key}={replace_with}"
             else:
+                if if_val:
+                    continue
                 lines.append(f"{match_key}={replace_with}")
         return "\n".join(lines) + ("\n" if lines else "")
 
@@ -134,16 +152,8 @@ class ConfigParser:
 
         for rep in replacements:
             match_path = rep.get("match", "")
+            if_val = rep.get("if_value", "")
             replace_with = self.resolve_value(rep.get("replace_with", rep.get("value", "")))
-            # Try to convert to int/bool if appropriate
-            parsed_val: Any = replace_with
-            if replace_with.lower() == "true":
-                parsed_val = True
-            elif replace_with.lower() == "false":
-                parsed_val = False
-            elif replace_with.isdigit():
-                parsed_val = int(replace_with)
-
             keys = match_path.split(".")
             current = data
             for k in keys[:-1]:
@@ -151,6 +161,16 @@ class ConfigParser:
                     current[k] = {}
                 current = current[k]
             if keys:
+                if if_val and keys[-1] in current:
+                    if not self._matches_if_value(if_val, str(current[keys[-1]])):
+                        continue
+                parsed_val: Any = replace_with
+                if replace_with.lower() == "true":
+                    parsed_val = True
+                elif replace_with.lower() == "false":
+                    parsed_val = False
+                elif replace_with.isdigit():
+                    parsed_val = int(replace_with)
                 current[keys[-1]] = parsed_val
 
         return json.dumps(data, indent=2) + "\n"
@@ -165,6 +185,7 @@ class ConfigParser:
 
         for rep in replacements:
             match_path = rep.get("match", "")
+            if_val = rep.get("if_value", "")
             replace_with = self.resolve_value(rep.get("replace_with", rep.get("value", "")))
             keys = match_path.split(".")
             current = data
@@ -173,6 +194,9 @@ class ConfigParser:
                     current[k] = {}
                 current = current[k]
             if keys:
+                if if_val and keys[-1] in current:
+                    if not self._matches_if_value(if_val, str(current[keys[-1]])):
+                        continue
                 current[keys[-1]] = replace_with
 
         return yaml.safe_dump(data, sort_keys=False)
@@ -184,7 +208,8 @@ class ConfigParser:
         result = content
         for rep in replacements:
             match_str = rep.get("match", "")
+            if_val = rep.get("if_value", "")
             replace_with = self.resolve_value(rep.get("replace_with", rep.get("value", "")))
-            if match_str:
+            if match_str and (not if_val or if_val in content):
                 result = result.replace(match_str, replace_with)
         return result

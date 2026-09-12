@@ -62,6 +62,11 @@ class ServerFilesystem:
         if target.exists() and target.is_dir():
             raise FilesystemError("Cannot write file, name conflicts with an existing directory by the same name.")
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            try:
+                target.chmod(0o666)
+            except OSError:
+                pass
         target.write_bytes(content)
 
     def upload(self, directory: str, uploads) -> list[dict]:

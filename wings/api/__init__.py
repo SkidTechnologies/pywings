@@ -527,6 +527,11 @@ def file_contents(server_uuid: str):
         response = current_app.make_response(target.read_bytes())
         response.headers["X-Mime-Type"] = stat["mime"]
         response.headers["Content-Length"] = str(stat["size"])
+        if request.args.get("download") is not None:
+            response.headers["Content-Disposition"] = f'attachment; filename="{target.name}"'
+            response.headers["Content-Type"] = "application/octet-stream"
+        else:
+            response.headers["Content-Type"] = "text/plain; charset=utf-8"
         return response
     except FilesystemError as exc:
         return jsonify({"error": str(exc)}), 404
@@ -540,10 +545,15 @@ def write_file(server_uuid: str):
     _, error = _require_server(server_uuid)
     if error:
         return error
+    file_param = request.args.get("file") or ""
+    if not file_param:
+        return jsonify({"error": "A file parameter is required."}), 400
     try:
-        _filesystem(server_uuid).write(request.args.get("file", ""), request.get_data())
+        content = request.get_data()
+        _filesystem(server_uuid).write(file_param, content)
         return "", 204
-    except FilesystemError as exc:
+    except (FilesystemError, PermissionError, OSError) as exc:
+        logger.warning("Failed writing to file %s for server %s: %s", file_param, server_uuid, exc)
         return jsonify({"error": str(exc)}), 400
 
 
