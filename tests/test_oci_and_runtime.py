@@ -159,6 +159,34 @@ class TestSafeLayerExtractor(unittest.TestCase):
         self.assertFalse((self.rootfs / "opt" / "app" / "two.txt").exists())
         self.assertTrue((self.rootfs / "opt" / "app" / "three.txt").exists())
 
+    def test_absolute_symlink_normalized_to_relative(self):
+        tar_path = Path(self.test_dir) / "symlink.tar"
+        with tarfile.open(tar_path, "w") as tar:
+            # Add target file: usr/lib/libcurl.so.4.8.0
+            data = b"fake curl lib"
+            ti_file = tarfile.TarInfo(name="usr/lib/libcurl.so.4.8.0")
+            ti_file.size = len(data)
+            tar.addfile(ti_file, io.BytesIO(data))
+
+            # Add symlink pointing to absolute container path: /usr/lib/libcurl.so.4.8.0
+            ti_sym = tarfile.TarInfo(name="usr/lib/libcurl.so.4")
+            ti_sym.type = tarfile.SYMTYPE
+            ti_sym.linkname = "/usr/lib/libcurl.so.4.8.0"
+            tar.addfile(ti_sym)
+
+        self.extractor.extract_layer(tar_path)
+        symlink_path = self.rootfs / "usr" / "lib" / "libcurl.so.4"
+        if os.name == "nt" and not symlink_path.is_symlink():
+            # Windows without Developer Mode falls back to copying the target file
+            self.assertTrue(symlink_path.exists())
+            self.assertEqual(symlink_path.read_bytes(), data)
+        else:
+            self.assertTrue(symlink_path.is_symlink())
+            # Target must be relative
+            target = os.readlink(symlink_path)
+            self.assertFalse(target.startswith("/"))
+            self.assertEqual((self.rootfs / "usr" / "lib" / target).resolve(), (self.rootfs / "usr" / "lib" / "libcurl.so.4.8.0").resolve())
+
 
 class TestProotRuntime(unittest.TestCase):
     def setUp(self):

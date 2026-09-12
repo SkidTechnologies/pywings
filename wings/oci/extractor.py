@@ -87,27 +87,33 @@ class SafeLayerExtractor:
         if not norm_name or norm_name == ".":
             return
 
-        dest_path = (self.target_rootfs / norm_name).resolve()
-
-        # Path traversal validation
-        if dest_path != self.target_rootfs and self.target_rootfs not in dest_path.parents:
+        # 1. Path traversal security check
+        parts = Path(norm_name).parts
+        if ".." in parts:
             raise ExtractionSecurityError(f"Path traversal detected in layer member: {member.name}")
+
+        dest_path = self.target_rootfs / norm_name
+
+        try:
+            dest_abs = os.path.abspath(dest_path)
+            rootfs_abs = os.path.abspath(self.target_rootfs)
+            if not (dest_abs == rootfs_abs or dest_abs.startswith(rootfs_abs + os.sep)):
+                raise ExtractionSecurityError(f"Path traversal detected in layer member: {member.name}")
+        except Exception as err:
+            if isinstance(err, ExtractionSecurityError):
+                raise
+            raise ExtractionSecurityError(f"Invalid member path: {member.name}") from err
 
         # Skip block and character device nodes
         if member.isblk() or member.ischr() or member.isfifo():
             logger.debug("Skipping special device node: %s", member.name)
             return
 
-        # Ensure parent directory exists and is a real directory (not an escaping symlink)
-        parent = dest_path.parent
-        if parent != self.target_rootfs:
-            if parent.is_symlink():
-                real_parent = parent.resolve()
-                if self.target_rootfs not in real_parent.parents and real_parent != self.target_rootfs:
-                    raise ExtractionSecurityError(f"Symlink traversal parent detected: {member.name}")
-            parent.mkdir(parents=True, exist_ok=True)
-
+        # 2. Directory members
         if member.isdir():
+            # If dest_path is a symlink to another directory (e.g. /bin -> usr/bin), keep symlink!
+            if os.path.islink(dest_path):
+                return
             dest_path.mkdir(parents=True, exist_ok=True)
             try:
                 dest_path.chmod(member.mode | stat.S_IRWXU)
@@ -115,45 +121,91 @@ class SafeLayerExtractor:
                 pass
             return
 
-        if member.isreg():
-            # If target previously existed as directory, remove it
-            if dest_path.is_dir() and not dest_path.is_symlink():
-                shutil.rmtree(dest_path, ignore_errors=True)
-            elif dest_path.exists() or dest_path.is_symlink():
-                dest_path.unlink(missing_ok=True)
+        # Ensure parent directory exists
+        parent = dest_path.parent
+        if not parent.exists() and not os.path.islink(parent):
+            parent.mkdir(parents=True, exist_ok=True)
 
-            with tar.extractfile(member) as source, open(dest_path, "wb") as target:
-                if source:
-                    shutil.copyfileobj(source, target)
+        # 3. Regular files
+        if member.isreg():
+            if os.path.islink(dest_path) or os.path.exists(dest_path):
+                if os.path.isdir(dest_path) and not os.path.islink(dest_path):
+                    shutil.rmtree(dest_path, ignore_errors=True)
+                else:
+                    try:
+                        os.unlink(dest_path)
+                    except OSError:
+                        pass
 
             try:
-                # Ensure owner can read/write and preserve execute bit if set in image
+                with tar.extractfile(member) as source:
+                    if source:
+                        with open(dest_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
+            except Exception as err:
+                logger.warning("Could not extract file %s: %s", dest_path, err)
+                return
+
+            try:
                 mode = member.mode | stat.S_IRUSR | stat.S_IWUSR
                 dest_path.chmod(mode)
             except OSError:
                 pass
             return
 
+        # 4. Symbolic links
         if member.issym():
-            dest_path.unlink(missing_ok=True)
-            # Normalize target if it points to rootfs
+            if os.path.islink(dest_path) or os.path.exists(dest_path):
+                try:
+                    os.unlink(dest_path)
+                except OSError:
+                    pass
+
             link_target = member.linkname
+            # If target is absolute (e.g. /bin/busybox or /usr/lib/libcurl.so.4),
+            # convert to a relative symlink within the rootfs so it works consistently
+            # both inside PRoot and outside on the host filesystem!
+            if link_target.startswith("/"):
+                target_in_rootfs = self.target_rootfs / link_target.lstrip("/\\")
+                try:
+                    rel_target = os.path.relpath(target_in_rootfs, dest_path.parent)
+                    link_target = rel_target.replace("\\", "/")
+                except ValueError:
+                    pass
+            else:
+                target_in_rootfs = dest_path.parent / link_target
+                target_abs = os.path.abspath(target_in_rootfs)
+                if not (target_abs == rootfs_abs or target_abs.startswith(rootfs_abs + os.sep)):
+                    raise ExtractionSecurityError(f"Symlink traversal detected: {member.name} -> {member.linkname}")
+
             try:
                 os.symlink(link_target, dest_path)
             except OSError as err:
                 logger.debug("Could not create symlink %s -> %s: %s", dest_path, link_target, err)
+                # On Windows without Developer Mode, fallback to file copy if target exists
+                resolved_target = dest_path.parent / link_target
+                if resolved_target.is_file():
+                    try:
+                        shutil.copy2(resolved_target, dest_path)
+                    except OSError:
+                        pass
             return
 
+        # 5. Hard links
         if member.islnk():
-            # Hardlink within rootfs
             src_norm = member.linkname.lstrip("/\\")
-            src_path = (self.target_rootfs / src_norm).resolve()
-            if self.target_rootfs not in src_path.parents and src_path != self.target_rootfs:
-                raise ExtractionSecurityError(f"Hardlink traversal detected: {member.name} -> {member.linkname}")
-            dest_path.unlink(missing_ok=True)
+            src_path = self.target_rootfs / src_norm
+            if os.path.islink(dest_path) or os.path.exists(dest_path):
+                try:
+                    os.unlink(dest_path)
+                except OSError:
+                    pass
             try:
                 os.link(src_path, dest_path)
             except OSError:
-                # Fallback to file copy if hard link is not supported across devices
                 if src_path.is_file():
-                    shutil.copy2(src_path, dest_path)
+                    try:
+                        shutil.copy2(src_path, dest_path)
+                    except OSError as err:
+                        logger.debug("Could not copy hardlink target %s -> %s: %s", src_path, dest_path, err)
+            return

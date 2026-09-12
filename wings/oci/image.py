@@ -52,8 +52,9 @@ class OciImageManager:
         manifest, manifest_digest = self.client.get_manifest(ref)
         config_digest = manifest.config_descriptor.digest
 
-        # Check if already cached and assembled
-        if not force_pull and self.cache.has_rootfs(config_digest):
+        # Check if already cached and assembled with current safe extractor version
+        version_marker = self.cache.get_rootfs_path(config_digest) / ".pywings_rootfs_v4"
+        if not force_pull and self.cache.has_rootfs(config_digest) and version_marker.exists():
             cached_config_json = self.cache.get_config(config_digest)
             if cached_config_json:
                 logger.info("Using cached assembled rootfs for image %s (%s)", ref, config_digest[:19])
@@ -101,6 +102,7 @@ class OciImageManager:
 
         # 5. Inject essential container configuration files
         self._inject_base_container_files(rootfs_path)
+        (rootfs_path / ".pywings_rootfs_v4").touch(exist_ok=True)
 
         logger.info("Successfully assembled OCI rootfs at %s", rootfs_path)
         return ImageInstance(
@@ -118,6 +120,8 @@ class OciImageManager:
 
         # resolv.conf (copy from host if exists, else public DNS)
         resolv_conf = etc / "resolv.conf"
+        if resolv_conf.is_symlink():
+            resolv_conf.unlink(missing_ok=True)
         if not resolv_conf.exists() or resolv_conf.stat().st_size == 0:
             if Path("/etc/resolv.conf").exists():
                 try:
@@ -129,6 +133,8 @@ class OciImageManager:
 
         # hosts
         hosts = etc / "hosts"
+        if hosts.is_symlink():
+            hosts.unlink(missing_ok=True)
         if not hosts.exists():
             hosts.write_text("127.0.0.1 localhost\n::1 localhost\n", encoding="utf-8")
 
