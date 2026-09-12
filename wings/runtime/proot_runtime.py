@@ -310,6 +310,15 @@ class ProotRuntime(ContainerRuntime):
         if environment:
             proc_env.update(environment)
 
+        # Guarantee standard system PATH directories are always included in PATH
+        env_path = proc_env.get("PATH", "")
+        standard_dirs = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        existing_dirs = [p for p in env_path.split(":") if p]
+        for s_dir in standard_dirs:
+            if s_dir not in existing_dirs:
+                existing_dirs.append(s_dir)
+        proc_env["PATH"] = ":".join(existing_dirs)
+
         is_installer = "_installer" in container
         logger.info(
             "Spawning PRoot container %s [rootfs=%s, cwd=%s, root-id=enabled]: %s",

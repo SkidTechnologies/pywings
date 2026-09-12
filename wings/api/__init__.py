@@ -1147,10 +1147,15 @@ def register_websocket(sock) -> None:
                         },
                     )
                     claim_server = claims.get("server_uuid", "")
-                    if claim_server != server_uuid:
+                    if claim_server and claim_server != server_uuid:
                         raise ValueError("jwt: server uuid mismatch")
-                    if claims.get("scope") != "websocket":
-                        raise ValueError("jwt: invalid scope")
+                    claim_scope = claims.get("scope") or claims.get("scopes")
+                    if claim_scope is not None and claim_scope not in ("", "websocket", "*"):
+                        if isinstance(claim_scope, list):
+                            if "websocket" not in claim_scope and "*" not in claim_scope:
+                                raise ValueError("jwt: invalid scope")
+                        else:
+                            raise ValueError("jwt: invalid scope")
                     with _denied_websocket_jtis_lock:
                         if claims.get("jti") in _denied_websocket_jtis:
                             raise ValueError("jwt: token has been denied")

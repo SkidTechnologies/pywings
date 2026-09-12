@@ -331,9 +331,15 @@ class ProcessManager:
                     logger.warning("Could not create installer container %s: %s", installer_name, err)
 
             install_cmd = (
+                f"export PATH=\"$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"; "
                 f"if command -v {shell_name} >/dev/null 2>&1; then exec {shell_name} /mnt/install/install.sh; "
                 f"elif command -v bash >/dev/null 2>&1; then exec bash /mnt/install/install.sh; "
                 f"elif command -v ash >/dev/null 2>&1; then exec ash /mnt/install/install.sh; "
+                f"elif [ -x /bin/bash ]; then exec /bin/bash /mnt/install/install.sh; "
+                f"elif [ -x /usr/bin/bash ]; then exec /usr/bin/bash /mnt/install/install.sh; "
+                f"elif [ -x /bin/sh ]; then exec /bin/sh /mnt/install/install.sh; "
+                f"elif [ -x /usr/bin/sh ]; then exec /usr/bin/sh /mnt/install/install.sh; "
+                f"elif [ -x /bin/ash ]; then exec /bin/ash /mnt/install/install.sh; "
                 f"else exec sh /mnt/install/install.sh; fi"
             )
             command = ["/bin/sh", "-c", install_cmd]
@@ -494,8 +500,11 @@ class ProcessManager:
             java_home = environment.setdefault("JAVA_HOME", "/opt/java/openjdk")
             current_path = environment.get("PATH", "")
             java_bin = f"{java_home}/bin"
-            if java_bin not in current_path.split(":"):
-                environment["PATH"] = f"{java_bin}:{current_path}" if current_path else java_bin
+            standard_paths = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            if not current_path:
+                environment["PATH"] = f"{java_bin}:{standard_paths}"
+            elif java_bin not in current_path.split(":"):
+                environment["PATH"] = f"{java_bin}:{current_path}"
 
     @staticmethod
     def _publishes(configuration: dict) -> list[str]:
