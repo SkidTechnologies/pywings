@@ -24,7 +24,11 @@ from wings.events import (
 )
 from wings.parser import ConfigParser
 from wings.remote import PanelRemoteClient
-from wings.runtime.udocker import RuntimeCommandError, RuntimeUnavailableError, UdockerRuntime
+from wings.runtime.pydocker import (
+    PyDockerRuntime,
+    RuntimeCommandError,
+    RuntimeUnavailableError,
+)
 from wings.servers import ServerStore
 
 
@@ -63,7 +67,7 @@ class ProcessManager:
     def __init__(
         self,
         store: ServerStore,
-        runtime: UdockerRuntime,
+        runtime: PyDockerRuntime | Any,
         allowed_mounts=(),
         remote_client: PanelRemoteClient | None = None,
     ) -> None:
@@ -286,18 +290,37 @@ class ProcessManager:
                 except Exception as err:
                     logger.warning("Could not refresh server configuration for %s: %s", server_uuid, err)
 
-            pref_shell = entrypoint.strip() if entrypoint else "bash"
-            shell_name = Path(pref_shell).name or "bash"
+            # Create /mnt/server and /mnt/install symlinks on host if possible
+            try:
+                Path("/mnt").mkdir(parents=True, exist_ok=True)
+                p_srv = Path("/mnt/server")
+                if not p_srv.exists() or p_srv.is_symlink():
+                    p_srv.unlink(missing_ok=True)
+                    p_srv.symlink_to(server_root)
+                p_inst = Path("/mnt/install")
+                if not p_inst.exists() or p_inst.is_symlink():
+                    p_inst.unlink(missing_ok=True)
+                    p_inst.symlink_to(install_dir)
+            except Exception:
+                pass
 
-            environment = self._environment(configuration)
-            self._apply_java_environment(container_image, environment)
-
-            # Write installation script to disk
+            # Write installation script to disk with wrapper
             script_file = install_dir / "install.sh"
             normalized_script = (script_text or "").replace("\r\n", "\n")
-            if not normalized_script.startswith("#!"):
-                normalized_script = "#!/bin/sh\n" + normalized_script
-            script_file.write_text(normalized_script, encoding="utf-8")
+            wrapper_header = (
+                f'export SERVER_DIR="{server_root}"\n'
+                'if [ ! -d /mnt/server ] && [ -d "$SERVER_DIR" ]; then\n'
+                '    mkdir -p /mnt 2>/dev/null || true\n'
+                '    ln -sfn "$SERVER_DIR" /mnt/server 2>/dev/null || true\n'
+                'fi\n'
+            )
+            if normalized_script.startswith("#!"):
+                lines = normalized_script.split("\n", 1)
+                full_script = lines[0] + "\n" + wrapper_header + (lines[1] if len(lines) > 1 else "")
+            else:
+                full_script = "#!/bin/sh\n" + wrapper_header + normalized_script
+
+            script_file.write_text(full_script, encoding="utf-8")
             try:
                 script_file.chmod(0o755)
             except Exception:
@@ -311,29 +334,17 @@ class ProcessManager:
             installer_name = f"{server_uuid}_installer"
 
             try:
-                self.runtime.pull(container_image)
-            except RuntimeCommandError as err:
-                logger.warning("Failed to pull installer image %s: %s", container_image, err)
-
-            try:
                 self.runtime.remove(installer_name)
             except Exception:
                 pass
 
             try:
                 self.runtime.create(installer_name, container_image)
-            except RuntimeCommandError as err:
-                if "already exists" not in str(err).lower() and "already used" not in str(err).lower():
-                    logger.warning("Could not create installer container %s: %s", installer_name, err)
+            except Exception:
+                pass
 
-            install_cmd = (
-                f"if command -v {shell_name} >/dev/null 2>&1; then exec {shell_name} /mnt/install/install.sh; "
-                f"elif command -v bash >/dev/null 2>&1; then exec bash /mnt/install/install.sh; "
-                f"elif command -v ash >/dev/null 2>&1; then exec ash /mnt/install/install.sh; "
-                f"else exec sh /mnt/install/install.sh; fi"
-            )
-            command = ["/bin/sh", "-c", install_cmd]
-            command, run_entrypoint = self._adapt_reviactyl_entrypoint(container_image, command, "")
+            shell_exe = shutil.which(entrypoint) or shutil.which("bash") or shutil.which("ash") or "/bin/sh"
+            command = [shell_exe, str(script_file)]
 
             try:
                 process = self.runtime.start_async(
@@ -342,7 +353,7 @@ class ProcessManager:
                     environment=environment,
                     volumes=volumes,
                     workdir="/mnt/server",
-                    entrypoint=run_entrypoint,
+                    entrypoint="",
                 )
 
                 # Close stdin immediately so the installer never hangs waiting for input

@@ -38,13 +38,13 @@ def create_app(settings: Settings | None = None) -> Flask:
         app.config["PANEL_LOCATION"], app.config["TOKEN_ID"], app.config["TOKEN"]
     )
     app.extensions["remote_client"] = remote_client
+
+    from wings.runtime import PyDockerRuntime
+    runtime = PyDockerRuntime(data_directory=app.config["DATA_DIRECTORY"])
+
     app.extensions["process_manager"] = ProcessManager(
         app.extensions["server_store"],
-        UdockerRuntime(
-            repository=Path(os.environ["UDOCKER_REPO"]).resolve()
-            if os.environ.get("UDOCKER_REPO")
-            else None
-        ),
+        runtime,
         app.config["ALLOWED_MOUNTS"],
         remote_client=remote_client,
     )
