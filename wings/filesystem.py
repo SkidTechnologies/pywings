@@ -215,7 +215,13 @@ class ServerFilesystem:
 
         raise FilesystemError("The archive provided is in a format Wings does not understand.")
 
-    def create_backup(self, backup_id: str | None = None, name: str | None = None, ignore: str | None = None) -> dict:
+    def create_backup(
+        self,
+        backup_id: str | None = None,
+        name: str | None = None,
+        ignore: str | None = None,
+        is_transfer: bool = False,
+    ) -> dict:
         backup_id = backup_id or str(uuid.uuid4())
         if Path(backup_id).name != backup_id:
             raise FilesystemError("Invalid backup identifier.")
@@ -235,8 +241,13 @@ class ServerFilesystem:
                 pass
 
         def filter_tar(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-            if tarinfo.name == "backups" or tarinfo.name.startswith("backups/"):
+            # During normal backups, exclude the backups directory itself
+            if not is_transfer and (tarinfo.name == "backups" or tarinfo.name.startswith("backups/")):
                 return None
+            # During server transfer, include existing server backups, but skip the transfer archive being generated
+            if is_transfer:
+                if tarinfo.name in (f"backups/{backup_id}.tar.gz", f"backups/transfer-{backup_id}.tar.gz") or tarinfo.name.startswith("backups/incoming-"):
+                    return None
             for rule in ignore_rules:
                 if rule == tarinfo.name or tarinfo.name.startswith(f"{rule}/") or tarinfo.name.endswith(f"/{rule}"):
                     return None
@@ -244,8 +255,11 @@ class ServerFilesystem:
 
         with tarfile.open(archive, "w:gz") as output:
             for entry in self.root.iterdir():
-                if entry.name != "backups" and entry.name != ".install":
-                    output.add(entry, arcname=entry.name, filter=filter_tar)
+                if entry.name == ".install":
+                    continue
+                if not is_transfer and entry.name == "backups":
+                    continue
+                output.add(entry, arcname=entry.name, filter=filter_tar)
 
         sha256 = hashlib.sha256()
         with archive.open("rb") as f:
@@ -278,24 +292,35 @@ class ServerFilesystem:
     def delete_backup(self, backup_id: str) -> None:
         if Path(backup_id).name != backup_id:
             raise FilesystemError("Invalid backup identifier.")
-        archive = self.root / "backups" / f"{backup_id}.tar.gz"
+        archive = self.backup_path(backup_id)
         if not archive.is_file():
             raise FilesystemError("The requested backup was not found.")
         archive.unlink()
 
     def backup_path(self, backup_id: str) -> Path:
+        if Path(backup_id).name != backup_id:
+            raise FilesystemError("Invalid backup identifier.")
         cand_paths = [
             self.root / "backups" / f"{backup_id}.tar.gz",
             self.root / f"{backup_id}.tar.gz",
             self.root.parent / "backups" / f"{backup_id}.tar.gz",
             Path("./data/backups") / f"{backup_id}.tar.gz",
+            Path("/var/lib/pterodactyl/backups") / f"{backup_id}.tar.gz",
         ]
         for p in cand_paths:
             if p.is_file():
                 return p
-        matches = list(self.root.parent.glob(f"**/{backup_id}.tar.gz"))
-        if matches:
-            return matches[0]
+
+        # Search recursively across data directory and home
+        for search_root in (self.root.parent, Path.home()):
+            try:
+                if search_root.is_dir():
+                    matches = list(search_root.glob(f"**/{backup_id}.tar.gz"))
+                    if matches and matches[0].is_file():
+                        return matches[0]
+            except Exception:
+                pass
+
         raise FilesystemError("The requested backup was not found on this system.")
 
     def restore_backup(self, backup_id: str, truncate_directory: bool = False, archive_path: Path | None = None) -> None:

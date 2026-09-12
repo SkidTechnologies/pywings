@@ -1008,7 +1008,7 @@ def server_transfer(server_uuid: str):
             pass
     try:
         current_app.extensions["process_manager"].stop(server_uuid, server.configuration)
-        archive = filesystem.create_backup(transfer_id, f"transfer-{transfer_id}")
+        archive = filesystem.create_backup(transfer_id, f"transfer-{transfer_id}", is_transfer=True)
     except FilesystemError as exc:
         return jsonify({"error": str(exc)}), 400
     with _transfers_lock:
