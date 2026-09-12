@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 from threading import Lock, RLock, Thread
 import time
 from typing import Any
