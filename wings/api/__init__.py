@@ -981,62 +981,65 @@ def server_transfer(server_uuid: str):
             return jsonify({"error": "destination_url must be a valid http or https URL."}), 400
         with _transfers_lock:
             _transfers[server_uuid]["status"] = "sending"
+        app = current_app._get_current_object()
+        archive_path = filesystem.backup_path(transfer_id)
         Thread(
             target=_send_transfer_worker,
-            args=(server_uuid, transfer_id, destination_url, transfer_token, server_uuid),
+            args=(app, server_uuid, transfer_id, destination_url, transfer_token, server_uuid, archive_path),
             daemon=True,
         ).start()
     return jsonify(_transfers[server_uuid]), 202
 
 
-def _send_transfer_worker(server_uuid: str, transfer_id: str, destination_url: str, token: str, source_uuid: str) -> None:
-    archive = _filesystem(server_uuid).backup_path(transfer_id)
-    parsed = urlparse(destination_url)
-    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    connection = connection_class(parsed.netloc, timeout=300)
-    boundary = f"----pywings-{uuid.uuid4().hex}"
-    prefix = (
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"server_uuid\"\r\n\r\n"
-        f"{source_uuid}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"archive\"; filename=\"{archive.name}\"\r\n"
-        "Content-Type: application/gzip\r\n\r\n"
-    ).encode()
-    suffix = f"\r\n--{boundary}--\r\n".encode()
-    path = parsed.path or "/api/transfers"
-    if parsed.query:
-        path += f"?{parsed.query}"
-    try:
-        connection.putrequest("POST", path)
-        connection.putheader("Authorization", f"Bearer {token}")
-        connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
-        connection.putheader("Content-Length", str(len(prefix) + archive.stat().st_size + len(suffix)))
-        connection.endheaders()
-        connection.send(prefix)
-        with archive.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                connection.send(chunk)
-        connection.send(suffix)
-        response = connection.getresponse()
-        if response.status < 200 or response.status >= 300:
-            raise RuntimeError(f"destination returned HTTP {response.status}")
-        status = "completed"
-        logger.info("Successfully pushed transfer archive for %s to %s", server_uuid, destination_url)
-    except Exception as error:
-        status = "failed"
-        logger.error("Failed sending server transfer for %s to %s: %s", server_uuid, destination_url, error)
+def _send_transfer_worker(app, server_uuid: str, transfer_id: str, destination_url: str, token: str, source_uuid: str, archive_path: Path) -> None:
+    with app.app_context():
+        archive = archive_path
+        parsed = urlparse(destination_url)
+        connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_class(parsed.netloc, timeout=300)
+        boundary = f"----pywings-{uuid.uuid4().hex}"
+        prefix = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"server_uuid\"\r\n\r\n"
+            f"{source_uuid}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"archive\"; filename=\"{archive.name}\"\r\n"
+            "Content-Type: application/gzip\r\n\r\n"
+        ).encode()
+        suffix = f"\r\n--{boundary}--\r\n".encode()
+        path = parsed.path or "/api/transfers"
+        if parsed.query:
+            path += f"?{parsed.query}"
+        try:
+            connection.putrequest("POST", path)
+            connection.putheader("Authorization", f"Bearer {token}")
+            connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+            connection.putheader("Content-Length", str(len(prefix) + archive.stat().st_size + len(suffix)))
+            connection.endheaders()
+            connection.send(prefix)
+            with archive.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    connection.send(chunk)
+            connection.send(suffix)
+            response = connection.getresponse()
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"destination returned HTTP {response.status}")
+            status = "completed"
+            logger.info("Successfully pushed transfer archive for %s to %s", server_uuid, destination_url)
+        except Exception as error:
+            status = "failed"
+            logger.error("Failed sending server transfer for %s to %s: %s", server_uuid, destination_url, error)
+            with _transfers_lock:
+                _transfers[server_uuid]["error"] = str(error)
+            remote = app.extensions.get("remote_client")
+            if remote and app.config["PANEL_LOCATION"]:
+                try:
+                    remote.set_transfer_status(server_uuid, False)
+                except Exception:
+                    pass
+            bus.publish(server_uuid, "transfer status", "failure")
+        finally:
+            connection.close()
         with _transfers_lock:
-            _transfers[server_uuid]["error"] = str(error)
-        remote = current_app.extensions.get("remote_client")
-        if remote and current_app.config["PANEL_LOCATION"]:
-            try:
-                remote.set_transfer_status(server_uuid, False)
-            except Exception:
-                pass
-        bus.publish(server_uuid, "transfer status", "failure")
-    finally:
-        connection.close()
-    with _transfers_lock:
-        if _transfers.get(server_uuid, {}).get("uuid") == transfer_id:
-            _transfers[server_uuid]["status"] = status
+            if _transfers.get(server_uuid, {}).get("uuid") == transfer_id:
+                _transfers[server_uuid]["status"] = status
 
 
 @api.route("/api/servers/<server_uuid>/ws/deny", methods=["POST", "OPTIONS"], provide_automatic_options=False)
