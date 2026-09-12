@@ -858,6 +858,17 @@ class ProcessManager:
             with self._lock:
                 process = self._processes.get(server_uuid)
 
+            pid = getattr(process, "pid", None)
+            server_root = (self.store.data_directory / server_uuid).resolve()
+
+            # 1. Instant kill to process group directly
+            if pid and hasattr(os, "killpg"):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+            # 2. Terminate entire process tree in runtime
             if process is not None:
                 try:
                     if hasattr(self.runtime, "terminate_process_tree"):
@@ -867,11 +878,34 @@ class ProcessManager:
                 except OSError:
                     pass
 
-            with self._lock:
-                self._processes.pop(server_uuid, None)
-                self._started_at.pop(server_uuid, None)
+            # 3. Kill all lingering/orphaned child processes running from server directory or pgrp
+            if os.path.exists("/proc"):
+                for entry in os.listdir("/proc"):
+                    if not entry.isdigit():
+                        continue
+                    p = int(entry)
+                    if p <= 1:
+                        continue
+                    try:
+                        is_target = False
+                        stat_text = Path(f"/proc/{p}/stat").read_text()
+                        rparen = stat_text.rfind(")")
+                        if rparen != -1:
+                            fields = stat_text[rparen + 1:].split()
+                            pgrp = int(fields[2])
+                            if pid and pgrp == pid:
+                                is_target = True
 
-            self.set_server_state(server_uuid, STATE_OFFLINE)
+                        if not is_target:
+                            cwd_path = Path(f"/proc/{p}/cwd").resolve()
+                            if cwd_path == server_root or server_root in cwd_path.parents:
+                                is_target = True
+
+                        if is_target:
+                            logger.info("Instant killing process %d for server %s", p, server_uuid)
+                            os.kill(p, signal.SIGKILL)
+                    except (OSError, ValueError, IndexError):
+                        pass
 
             with self._lock:
                 self._processes.pop(server_uuid, None)

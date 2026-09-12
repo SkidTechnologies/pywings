@@ -71,22 +71,24 @@ def require_authorization(view):
     return wrapped
 
 
-def _decode_file_token(raw_token: str, scope: str = "file-download") -> dict:
+def _decode_file_token(raw_token: str, expected_scope: str = "file-download") -> dict:
+    if not raw_token:
+        raise ValueError("Missing token query parameter")
     claims = jwt.decode(
         raw_token,
         current_app.config["TOKEN"],
         algorithms=["HS256"],
         options={"verify_aud": False, "verify_iat": False, "verify_nbf": False},
     )
-    if claims.get("scope") != scope:
-        raise ValueError(f"token does not have {scope} scope")
-    unique_id = claims.get("unique_id")
-    if not unique_id:
-        raise ValueError("file token has no unique_id")
-    with _used_file_tokens_lock:
-        if unique_id in _used_file_tokens:
-            raise ValueError("file token has already been used")
-        _used_file_tokens.add(unique_id)
+    scope = claims.get("scope") or claims.get("scopes")
+    if scope:
+        if isinstance(scope, list):
+            if expected_scope not in scope and "*" not in scope:
+                raise ValueError(f"token does not have {expected_scope} scope")
+        elif isinstance(scope, str):
+            scopes = scope.split()
+            if expected_scope not in scopes and "*" not in scopes and expected_scope not in scope:
+                raise ValueError(f"token does not have {expected_scope} scope")
     return claims
 
 
@@ -108,22 +110,46 @@ def download_file():
             download_name=target.name,
             mimetype="application/octet-stream",
         )
-    except (jwt.InvalidTokenError, ValueError, FilesystemError):
+    except Exception as err:
+        logger.warning("Download file failed: %s", err)
         return jsonify({"error": "The requested resource was not found on this server."}), 404
 
 
 @api.get("/download/backup")
 def download_backup_signed():
     try:
-        claims = _decode_file_token(request.args.get("token", ""), "backup-download")
+        raw_token = request.args.get("token", "")
+        claims = _decode_file_token(raw_token, "backup-download")
         server_uuid = claims.get("server_uuid", "")
-        _server, error = _require_server(server_uuid)
-        if error:
-            return error
         backup_id = claims.get("backup_uuid") or claims.get("backup_id")
-        archive = _filesystem(server_uuid).backup_path(str(backup_id))
-        return send_file(archive, as_attachment=True, download_name=archive.name, mimetype="application/gzip")
-    except (jwt.InvalidTokenError, ValueError, FilesystemError):
+        if not backup_id:
+            raise ValueError("Token missing backup_uuid")
+
+        cand_paths = []
+        if server_uuid:
+            cand_paths.append(_server_store().data_directory / server_uuid / "backups" / f"{backup_id}.tar.gz")
+            cand_paths.append(_server_store().data_directory / server_uuid / f"{backup_id}.tar.gz")
+        cand_paths.append(_server_store().data_directory / "backups" / f"{backup_id}.tar.gz")
+        cand_paths.append(Path(current_app.config.get("DATA_DIRECTORY", "./data")) / "backups" / f"{backup_id}.tar.gz")
+
+        archive = None
+        for p in cand_paths:
+            if p.is_file():
+                archive = p
+                break
+
+        if not archive:
+            matches = list(_server_store().data_directory.glob(f"**/{backup_id}.tar.gz"))
+            if matches:
+                archive = matches[0]
+
+        if not archive or not archive.is_file():
+            logger.warning("Backup file not found on disk for %s (searched: %s)", backup_id, [str(p) for p in cand_paths])
+            return jsonify({"error": "The requested backup was not found on this server."}), 404
+
+        return send_file(archive, as_attachment=True, download_name=f"backup-{backup_id}.tar.gz", mimetype="application/gzip")
+    except Exception as err:
+        logger.warning("Download backup failed: %s", err)
         return jsonify({"error": "The requested resource was not found on this server."}), 404
 
 
