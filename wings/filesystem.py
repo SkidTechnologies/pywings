@@ -1,6 +1,7 @@
 """Safe filesystem operations rooted inside one server data directory."""
 
 from datetime import datetime, timezone
+import hashlib
 import mimetypes
 from pathlib import Path
 import shutil
@@ -195,19 +196,53 @@ class ServerFilesystem:
         else:
             raise FilesystemError("The archive provided is in a format Wings does not understand.")
 
-    def create_backup(self, backup_id: str | None = None, name: str | None = None) -> dict:
+    def create_backup(self, backup_id: str | None = None, name: str | None = None, ignore: str | None = None) -> dict:
         backup_id = backup_id or str(uuid.uuid4())
         if Path(backup_id).name != backup_id:
             raise FilesystemError("Invalid backup identifier.")
         backup_dir = self.root / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         archive = backup_dir / f"{backup_id}.tar.gz"
+
+        ignore_rules = [r.strip() for r in (ignore or "").splitlines() if r.strip() and not r.strip().startswith("#")]
+        pteroignore = self.root / ".pteroignore"
+        if pteroignore.is_file():
+            try:
+                for line in pteroignore.read_text(encoding="utf-8", errors="replace").splitlines():
+                    cleaned = line.strip()
+                    if cleaned and not cleaned.startswith("#") and cleaned not in ignore_rules:
+                        ignore_rules.append(cleaned)
+            except OSError:
+                pass
+
+        def filter_tar(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+            if tarinfo.name == "backups" or tarinfo.name.startswith("backups/"):
+                return None
+            for rule in ignore_rules:
+                if rule == tarinfo.name or tarinfo.name.startswith(f"{rule}/") or tarinfo.name.endswith(f"/{rule}"):
+                    return None
+            return tarinfo
+
         with tarfile.open(archive, "w:gz") as output:
             for entry in self.root.iterdir():
-                if entry.name != "backups":
-                    output.add(entry, arcname=entry.name)
+                if entry.name != "backups" and entry.name != ".install":
+                    output.add(entry, arcname=entry.name, filter=filter_tar)
+
+        sha256 = hashlib.sha256()
+        with archive.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        checksum = sha256.hexdigest()
+
         stat = self.stat(archive)
-        stat.update({"uuid": backup_id, "name": name or archive.name, "successful": True})
+        stat.update({
+            "uuid": backup_id,
+            "name": name or archive.name,
+            "successful": True,
+            "checksum": checksum,
+            "checksum_type": "sha256",
+            "bytes": archive.stat().st_size,
+        })
         return stat
 
     def list_backups(self) -> list[dict]:
@@ -237,8 +272,16 @@ class ServerFilesystem:
             raise FilesystemError("The requested backup was not found.")
         return archive
 
-    def restore_backup(self, backup_id: str) -> None:
+    def restore_backup(self, backup_id: str, truncate_directory: bool = False) -> None:
         archive = self.backup_path(backup_id)
+        if truncate_directory:
+            for entry in self.root.iterdir():
+                if entry.name != "backups" and entry.name != ".install":
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink(missing_ok=True)
+
         with tarfile.open(archive, "r:gz") as source:
             members = source.getmembers()
             for member in members:

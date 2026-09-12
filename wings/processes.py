@@ -81,6 +81,8 @@ class ProcessManager:
         self._last_crash: dict[str, float] = {}
         self._cpu_history: dict[str, tuple[float, int]] = {}
         self._disk_cache: dict[str, tuple[float, int]] = {}
+        self._net_baseline: dict[str, tuple[int, int]] = {}
+        self._last_net: dict[str, tuple[int, int]] = {}
         self._lock = RLock()
 
     def _get_server_lock(self, server_uuid: str) -> RLock:
@@ -203,6 +205,7 @@ class ProcessManager:
         with self._lock:
             self._processes[server_uuid] = process
             self._started_at[server_uuid] = time.monotonic()
+            self._net_baseline[server_uuid] = self._read_network_bytes()
 
         bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server process started.")
         Thread(target=self._watch, args=(server_uuid, process, configuration), daemon=True).start()
@@ -772,14 +775,15 @@ class ProcessManager:
             return
         cpu_violations = 0
         while process.poll() is None:
-            if memory_limit and self._linux_rss(getattr(process, "pid", None)) > memory_limit:
+            pid = getattr(process, "pid", None)
+            if memory_limit and self._linux_rss(pid) > memory_limit:
                 self._limit_kill(server_uuid, process, "memory")
                 return
             if disk_limit and self._disk_usage(server_uuid) > disk_limit:
                 self._limit_kill(server_uuid, process, "disk")
                 return
             if cpu_limit:
-                if self._linux_cpu_percent(getattr(process, "pid", None)) > cpu_limit:
+                if self._linux_cpu_percent(server_uuid, pid) > cpu_limit:
                     cpu_violations += 1
                 else:
                     cpu_violations = 0
@@ -794,13 +798,8 @@ class ProcessManager:
         with log_path.open("a", encoding="utf-8") as log_file:
             log_file.write(msg)
         bus.publish(server_uuid, ConsoleOutputEvent, msg.strip())
-        try:
-            if hasattr(self.runtime, "terminate_process_tree"):
-                self.runtime.terminate_process_tree(getattr(process, "pid", None), force=True)
-            else:
-                process.kill()
-        except OSError:
-            pass
+        bus.publish(server_uuid, DaemonMessageEvent, f"[Wings Daemon]: Server stopped: {resource} limit exceeded.")
+        self.kill(server_uuid)
 
     def stop(self, server_uuid: str, configuration: dict | None = None, wait_seconds: int = 30) -> None:
         lock = self._get_server_lock(server_uuid)
@@ -834,14 +833,14 @@ class ProcessManager:
             except Exception:
                 try:
                     if hasattr(self.runtime, "terminate_process_tree"):
-                        self.runtime.terminate_process_tree(getattr(process, "pid", None), force=False)
+                        self.runtime.terminate_process_tree(process, force=False)
                     else:
                         process.terminate()
                     process.wait(timeout=5)
                 except Exception:
                     try:
                         if hasattr(self.runtime, "terminate_process_tree"):
-                            self.runtime.terminate_process_tree(getattr(process, "pid", None), force=True)
+                            self.runtime.terminate_process_tree(process, force=True)
                         else:
                             process.kill()
                     except Exception:
@@ -862,11 +861,17 @@ class ProcessManager:
             if process is not None:
                 try:
                     if hasattr(self.runtime, "terminate_process_tree"):
-                        self.runtime.terminate_process_tree(getattr(process, "pid", None), force=True)
+                        self.runtime.terminate_process_tree(process, force=True)
                     else:
                         process.kill()
                 except OSError:
                     pass
+
+            with self._lock:
+                self._processes.pop(server_uuid, None)
+                self._started_at.pop(server_uuid, None)
+
+            self.set_server_state(server_uuid, STATE_OFFLINE)
 
             with self._lock:
                 self._processes.pop(server_uuid, None)
@@ -916,6 +921,30 @@ class ProcessManager:
                 pass
             self.set_server_state(server_uuid, STATE_OFFLINE)
 
+    @staticmethod
+    def _read_network_bytes() -> tuple[int, int]:
+        """Read total rx_bytes and tx_bytes from non-loopback interfaces in /proc/net/dev."""
+        path = Path("/proc/net/dev")
+        if not path.exists():
+            return 0, 0
+        total_rx = 0
+        total_tx = 0
+        try:
+            for line in path.read_text().splitlines():
+                if ":" not in line:
+                    continue
+                iface, data = line.split(":", 1)
+                iface = iface.strip()
+                if iface == "lo":
+                    continue
+                parts = data.split()
+                if len(parts) >= 9:
+                    total_rx += int(parts[0])
+                    total_tx += int(parts[8])
+        except Exception:
+            pass
+        return total_rx, total_tx
+
     def stats(self, server_uuid: str) -> dict:
         """Return Wings-shaped resource data for one managed process."""
         server = self.store.get(server_uuid)
@@ -931,12 +960,21 @@ class ProcessManager:
             started_at = self._started_at.get(server_uuid)
 
         current_state = server.state if server else STATE_OFFLINE
+        baseline = self._net_baseline.get(server_uuid)
+        cur_rx, cur_tx = self._read_network_bytes()
+        if baseline and process is not None and process.poll() is None:
+            rx_bytes = max(0, cur_rx - baseline[0])
+            tx_bytes = max(0, cur_tx - baseline[1])
+            self._last_net[server_uuid] = (rx_bytes, tx_bytes)
+        else:
+            rx_bytes, tx_bytes = self._last_net.get(server_uuid, (0, 0))
+
         if process is None or process.poll() is not None:
             return {
                 "memory_bytes": 0,
                 "memory_limit_bytes": memory_limit,
                 "cpu_absolute": 0.0,
-                "network": {"rx_bytes": 0, "tx_bytes": 0},
+                "network": {"rx_bytes": rx_bytes, "tx_bytes": tx_bytes},
                 "uptime": 0,
                 "state": current_state if current_state != STATE_RUNNING else STATE_OFFLINE,
                 "disk_bytes": self._disk_usage(server_uuid),
@@ -949,7 +987,7 @@ class ProcessManager:
             "memory_bytes": memory_bytes,
             "memory_limit_bytes": memory_limit,
             "cpu_absolute": cpu_absolute,
-            "network": {"rx_bytes": 0, "tx_bytes": 0},
+            "network": {"rx_bytes": rx_bytes, "tx_bytes": tx_bytes},
             "uptime": max(0, int(time.monotonic() - (started_at or time.monotonic()))),
             "state": current_state,
             "disk_bytes": self._disk_usage(server_uuid),
@@ -984,18 +1022,25 @@ class ProcessManager:
             return []
         pids = {root_pid}
         try:
+            parent_map: dict[int, int] = {}
             for entry in os.listdir("/proc"):
-                if entry.isdigit() and int(entry) not in pids:
+                if entry.isdigit():
+                    pid = int(entry)
                     try:
                         stat_text = Path(f"/proc/{entry}/stat").read_text()
                         rparen = stat_text.rfind(")")
                         if rparen != -1:
-                            parts = stat_text[rparen + 1:].split()
-                            ppid = int(parts[1])
-                            if ppid in pids:
-                                pids.add(int(entry))
+                            ppid = int(stat_text[rparen + 1:].split()[1])
+                            parent_map[pid] = ppid
                     except Exception:
                         continue
+            changed = True
+            while changed:
+                changed = False
+                for pid, ppid in parent_map.items():
+                    if ppid in pids and pid not in pids:
+                        pids.add(pid)
+                        changed = True
         except Exception:
             pass
         return list(pids)

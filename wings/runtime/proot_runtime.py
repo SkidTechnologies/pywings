@@ -366,9 +366,39 @@ class ProotRuntime(ContainerRuntime):
             start_new_session=True,  # Isolates process group for clean tree termination
         )
 
-    @staticmethod
-    def terminate_process_tree(proc_or_pid: Any, force: bool = False, wait_seconds: int = 10) -> None:
-        """Atomically terminate the entire process group spawned by PRoot."""
+    @classmethod
+    def _find_all_descendants(cls, root_pid: int) -> list[int]:
+        """Find root PID and all descendant PIDs by scanning /proc."""
+        if not root_pid or not os.path.exists("/proc"):
+            return [root_pid] if root_pid else []
+        pids = {root_pid}
+        try:
+            parent_map: dict[int, int] = {}
+            for entry in os.listdir("/proc"):
+                if entry.isdigit():
+                    pid = int(entry)
+                    try:
+                        stat_text = Path(f"/proc/{entry}/stat").read_text()
+                        rparen = stat_text.rfind(")")
+                        if rparen != -1:
+                            ppid = int(stat_text[rparen + 1:].split()[1])
+                            parent_map[pid] = ppid
+                    except Exception:
+                        continue
+            changed = True
+            while changed:
+                changed = False
+                for pid, ppid in parent_map.items():
+                    if ppid in pids and pid not in pids:
+                        pids.add(pid)
+                        changed = True
+        except Exception:
+            pass
+        return list(pids)
+
+    @classmethod
+    def terminate_process_tree(cls, proc_or_pid: Any, force: bool = False, wait_seconds: int = 10) -> None:
+        """Atomically terminate the entire process tree (all descendants) spawned by PRoot."""
         if proc_or_pid is None:
             return
 
@@ -383,45 +413,75 @@ class ProotRuntime(ContainerRuntime):
         else:
             return
 
-        logger.info("Terminating process tree for PID %d (process group, force=%s)", pid, force)
+        logger.info("Terminating process tree for PID %d (force=%s)", pid, force)
+        descendants = cls._find_all_descendants(pid)
 
-        # Attempt termination of the whole process group
+        # 1. Kill the process group first
         sig = signal.SIGKILL if force else signal.SIGTERM
         if hasattr(os, "killpg") and hasattr(os, "getpgid"):
             try:
                 pgid = os.getpgid(pid)
                 os.killpg(pgid, sig)
             except (ProcessLookupError, OSError):
-                if proc is not None:
-                    try:
-                        proc.kill() if force else proc.terminate()
-                    except OSError:
-                        pass
-        elif proc is not None:
+                pass
+
+        # 2. Kill each descendant PID individually
+        for p in reversed(descendants):
+            try:
+                os.kill(p, sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+        if proc is not None:
             try:
                 proc.kill() if force else proc.terminate()
             except OSError:
                 pass
 
-        if force or proc is None:
+        if force:
+            for p in descendants:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
             return
 
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
+            if proc is not None and proc.poll() is not None:
+                return
+            # Check if all descendants are gone
+            any_alive = False
+            for p in descendants:
+                if os.path.exists(f"/proc/{p}"):
+                    any_alive = True
+                    break
+            if not any_alive:
                 return
             time.sleep(0.2)
 
-        # Forceful kill if still running
-        logger.warning("Process group for PID %d did not stop gracefully; sending SIGKILL", pid)
+        # Force kill any remaining processes
+        logger.warning("Descendants for PID %d did not stop gracefully; sending SIGKILL to all", pid)
         if hasattr(os, "killpg") and hasattr(os, "getpgid"):
             try:
                 pgid = os.getpgid(pid)
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
-        try:
-            proc.kill()
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+        for p in descendants:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass

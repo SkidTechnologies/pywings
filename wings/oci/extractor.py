@@ -141,7 +141,7 @@ class SafeLayerExtractor:
                 with tar.extractfile(member) as source:
                     if source:
                         with open(dest_path, "wb") as target:
-                            shutil.copyfileobj(source, target)
+                            shutil.copyfileobj(source, target, length=1024 * 1024)
             except Exception as err:
                 logger.warning("Could not extract file %s: %s", dest_path, err)
                 return

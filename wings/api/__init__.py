@@ -405,6 +405,7 @@ def server_resources(server_uuid: str):
     return jsonify(current_app.extensions["process_manager"].stats(server_uuid))
 
 
+@api.route("/api/servers/<server_uuid>/backup", methods=["GET", "POST", "OPTIONS"], provide_automatic_options=False)
 @api.route("/api/servers/<server_uuid>/backups", methods=["GET", "POST", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def server_backups(server_uuid: str):
@@ -416,38 +417,63 @@ def server_backups(server_uuid: str):
     filesystem = _filesystem(server_uuid)
     if request.method == "GET":
         return jsonify(filesystem.list_backups())
+
     payload = request.get_json(silent=True) or {}
     backup_uuid = str(payload.get("uuid") or uuid.uuid4())
     name = payload.get("name")
-    try:
-        backup = filesystem.create_backup(backup_uuid, name)
-        bus.publish(server_uuid, "backup completed", json.dumps(backup))
-        if current_app.config["PANEL_LOCATION"]:
-            remote = current_app.extensions["remote_client"]
-            Thread(
-                target=remote.set_backup_status,
-                args=(backup_uuid, {
+    ignore = payload.get("ignore")
+
+    app = current_app._get_current_object()
+
+    def _async_backup():
+        with app.app_context():
+            try:
+                backup = filesystem.create_backup(backup_uuid, name, ignore)
+                bus.publish(server_uuid, "backup completed", json.dumps({
+                    "uuid": backup_uuid,
+                    "is_successful": True,
                     "checksum": backup.get("checksum", ""),
                     "checksum_type": "sha256",
-                    "size": backup.get("bytes", 0),
-                    "successful": True,
-                    "parts": [],
-                }),
-                daemon=True,
-            ).start()
-        return jsonify(backup), 202
-    except FilesystemError as exc:
-        if current_app.config["PANEL_LOCATION"]:
-            remote = current_app.extensions["remote_client"]
-            Thread(
-                target=remote.set_backup_status,
-                args=(backup_uuid, {"checksum": "", "checksum_type": "sha256", "size": 0, "successful": False, "parts": []}),
-                daemon=True,
-            ).start()
-        return jsonify({"error": str(exc)}), 400
+                    "file_size": backup.get("bytes", 0),
+                }))
+                if app.config["PANEL_LOCATION"]:
+                    remote = app.extensions["remote_client"]
+                    remote.set_backup_status(backup_uuid, {
+                        "checksum": backup.get("checksum", ""),
+                        "checksum_type": "sha256",
+                        "size": backup.get("bytes", 0),
+                        "successful": True,
+                        "parts": [],
+                    })
+                logger.info("Backup %s for %s completed successfully", backup_uuid, server_uuid)
+            except Exception as exc:
+                logger.error("Failed creating backup %s for %s: %s", backup_uuid, server_uuid, exc)
+                bus.publish(server_uuid, "backup completed", json.dumps({
+                    "uuid": backup_uuid,
+                    "is_successful": False,
+                    "checksum": "",
+                    "checksum_type": "sha256",
+                    "file_size": 0,
+                }))
+                if app.config["PANEL_LOCATION"]:
+                    try:
+                        remote = app.extensions["remote_client"]
+                        remote.set_backup_status(backup_uuid, {
+                            "checksum": "",
+                            "checksum_type": "sha256",
+                            "size": 0,
+                            "successful": False,
+                            "parts": [],
+                        })
+                    except Exception:
+                        pass
+
+    Thread(target=_async_backup, daemon=True).start()
+    return jsonify({"uuid": backup_uuid, "successful": True}), 202
 
 
 @api.route("/api/servers/<server_uuid>/backup/<backup_uuid>", methods=["DELETE", "OPTIONS"], provide_automatic_options=False)
+@api.route("/api/servers/<server_uuid>/backups/<backup_uuid>", methods=["DELETE", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def delete_backup(server_uuid: str, backup_uuid: str):
     if request.method == "OPTIONS":
@@ -463,6 +489,7 @@ def delete_backup(server_uuid: str, backup_uuid: str):
 
 
 @api.route("/api/servers/<server_uuid>/backup/<backup_uuid>/download", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+@api.route("/api/servers/<server_uuid>/backups/<backup_uuid>/download", methods=["GET", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def download_backup(server_uuid: str, backup_uuid: str):
     if request.method == "OPTIONS":
@@ -478,6 +505,7 @@ def download_backup(server_uuid: str, backup_uuid: str):
 
 
 @api.route("/api/servers/<server_uuid>/backup/<backup_uuid>/restore", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+@api.route("/api/servers/<server_uuid>/backups/<backup_uuid>/restore", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def restore_backup(server_uuid: str, backup_uuid: str):
     if request.method == "OPTIONS":
@@ -485,20 +513,32 @@ def restore_backup(server_uuid: str, backup_uuid: str):
     server, error = _require_server(server_uuid)
     if error:
         return error
+    payload = request.get_json(silent=True) or {}
+    truncate_directory = bool(payload.get("truncate_directory", False))
     manager = current_app.extensions["process_manager"]
-    try:
-        manager.stop(server_uuid, server.configuration)
-        _filesystem(server_uuid).restore_backup(backup_uuid)
-        bus.publish(server_uuid, "backup restore completed")
-        if current_app.config["PANEL_LOCATION"]:
-            remote = current_app.extensions["remote_client"]
-            Thread(target=remote.send_restoration_status, args=(backup_uuid, True), daemon=True).start()
-        return "", 202
-    except FilesystemError as exc:
-        if current_app.config["PANEL_LOCATION"]:
-            remote = current_app.extensions["remote_client"]
-            Thread(target=remote.send_restoration_status, args=(backup_uuid, False), daemon=True).start()
-        return jsonify({"error": str(exc)}), 400
+    app = current_app._get_current_object()
+
+    def _async_restore():
+        with app.app_context():
+            try:
+                manager.stop(server_uuid, server.configuration)
+                _filesystem(server_uuid).restore_backup(backup_uuid, truncate_directory=truncate_directory)
+                bus.publish(server_uuid, "backup restore completed")
+                if app.config["PANEL_LOCATION"]:
+                    remote = app.extensions["remote_client"]
+                    remote.send_restoration_status(backup_uuid, True)
+                logger.info("Backup %s for %s restored successfully", backup_uuid, server_uuid)
+            except Exception as exc:
+                logger.error("Failed restoring backup %s for %s: %s", backup_uuid, server_uuid, exc)
+                if app.config["PANEL_LOCATION"]:
+                    try:
+                        remote = app.extensions["remote_client"]
+                        remote.send_restoration_status(backup_uuid, False)
+                    except Exception:
+                        pass
+
+    Thread(target=_async_restore, daemon=True).start()
+    return "", 202
 
 
 @api.route(

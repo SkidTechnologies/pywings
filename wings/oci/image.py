@@ -46,6 +46,33 @@ class OciImageManager:
     ) -> ImageInstance:
         """Fetch, verify, extract, and return the assembled OCI rootfs and config."""
         ref = OciReference.parse(image_str)
+        ref_key = ref.normalized_name.replace("/", "_").replace(":", "_").replace("@", "_")
+        refs_dir = self.cache.base_dir / "refs"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        ref_cache_file = refs_dir / f"{ref_key}.json"
+
+        # FAST BOOT: If image is already assembled locally, skip network requests and boot instantly!
+        if not force_pull and ref_cache_file.is_file():
+            try:
+                ref_data = json.loads(ref_cache_file.read_text(encoding="utf-8"))
+                config_digest = ref_data.get("config_digest")
+                manifest_digest = ref_data.get("manifest_digest", config_digest)
+                if config_digest:
+                    version_marker = self.cache.get_rootfs_path(config_digest) / ".pywings_rootfs_v4"
+                    if self.cache.has_rootfs(config_digest) and version_marker.exists():
+                        cached_config_json = self.cache.get_config(config_digest)
+                        if cached_config_json:
+                            logger.info("Instant boot: using cached assembled rootfs for image %s (%s)", ref, config_digest[:19])
+                            return ImageInstance(
+                                reference=ref,
+                                manifest_digest=manifest_digest,
+                                config_digest=config_digest,
+                                config=ImageConfig.from_dict(cached_config_json),
+                                rootfs=self.cache.get_rootfs_path(config_digest),
+                            )
+            except Exception:
+                pass
+
         logger.info("Pulling OCI image %s (%s)", image_str, ref)
 
         # 1. Fetch manifest (resolves multi-arch index / manifest list automatically)
@@ -58,6 +85,14 @@ class OciImageManager:
             cached_config_json = self.cache.get_config(config_digest)
             if cached_config_json:
                 logger.info("Using cached assembled rootfs for image %s (%s)", ref, config_digest[:19])
+                # Save reference cache for subsequent boots
+                try:
+                    ref_cache_file.write_text(json.dumps({
+                        "config_digest": config_digest,
+                        "manifest_digest": manifest_digest,
+                    }), encoding="utf-8")
+                except Exception:
+                    pass
                 return ImageInstance(
                     reference=ref,
                     manifest_digest=manifest_digest,
@@ -103,6 +138,13 @@ class OciImageManager:
         # 5. Inject essential container configuration files
         self._inject_base_container_files(rootfs_path)
         (rootfs_path / ".pywings_rootfs_v4").touch(exist_ok=True)
+        try:
+            ref_cache_file.write_text(json.dumps({
+                "config_digest": config_digest,
+                "manifest_digest": manifest_digest,
+            }), encoding="utf-8")
+        except Exception:
+            pass
 
         logger.info("Successfully assembled OCI rootfs at %s", rootfs_path)
         return ImageInstance(
