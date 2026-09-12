@@ -71,11 +71,15 @@ class UdockerRuntime:
 
         command = self._command(*args)
         logger.debug("Executing udocker command: %s", " ".join(command))
+        proc_env = dict(os.environ)
+        proc_env["PROOT_NO_SECCOMP"] = "1"
+        proc_env["UDOCKER_DEFAULT_EXECUTION_MODE"] = "P1"
         result = self._runner(
             command,
             capture_output=True,
             text=True,
             check=False,
+            env=proc_env,
             shell=False,
         )
         normalized = CommandResult(
@@ -117,7 +121,7 @@ class UdockerRuntime:
     ) -> subprocess.Popen[str]:
         if shutil.which(self.executable) is None and Path(self.executable).name == self.executable:
             raise RuntimeUnavailableError(f"udocker was not found in PATH: {self.executable!r}")
-        options = ["--nobanner"]
+        options = ["--nobanner", "--env=PROOT_NO_SECCOMP=1"]
         for volume in volumes:
             options.append(f"--volume={volume}")
         for publish in publishes:
@@ -133,7 +137,8 @@ class UdockerRuntime:
         full_cmd = self._command("run", *options, container, *command)
         logger.info("Starting container %s: %s", container, " ".join(full_cmd))
         proc_env = dict(os.environ)
-        proc_env.setdefault("PROOT_NO_SECCOMP", "1")
+        proc_env["PROOT_NO_SECCOMP"] = "1"
+        proc_env["UDOCKER_DEFAULT_EXECUTION_MODE"] = "P1"
         proc_env["PYTHONUNBUFFERED"] = "1"
         return subprocess.Popen(
             full_cmd,
