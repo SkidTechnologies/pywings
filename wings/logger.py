@@ -83,7 +83,7 @@ def setup_logging(debug: bool = False) -> None:
     root_logger.addHandler(handler)
 
     # Set logger levels for sub-modules
-    for mod in ("wings", "wings.api", "wings.processes", "wings.remote", "wings.sftp", "wings.oci", "wings.runtime.proot", "wings.events"):
+    for mod in ("wings", "wings.api", "wings.processes", "wings.remote", "wings.sftp", "wings.oci", "wings.runtime.proot", "wings.events", "wings.updater"):
         l = logging.getLogger(mod)
         l.setLevel(log_level)
         l.propagate = True

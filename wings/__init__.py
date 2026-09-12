@@ -70,6 +70,19 @@ def create_app(settings: Settings | None = None) -> Flask:
     except Exception as err:
         logger.warning("Could not start SFTP server: %s", err)
 
+    # Start background auto-updater to keep pywings up to date with remote git repository
+    try:
+        from wings.updater import AutoUpdater
+        updater = AutoUpdater(
+            app=app,
+            interval_seconds=int(os.getenv("WINGS_UPDATE_INTERVAL", 60)),
+            enabled=os.getenv("WINGS_AUTO_UPDATE", "true").lower() in {"1", "true", "yes", "on"},
+        )
+        updater.start()
+        app.extensions["updater"] = updater
+    except Exception as err:
+        logger.warning("Could not initialize auto-updater: %s", err)
+
     @app.before_request
     def record_request_start():
         request._wings_start_time = time.monotonic()

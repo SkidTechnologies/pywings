@@ -251,6 +251,22 @@ def system_information():
     return jsonify(response)
 
 
+@api.route("/api/system/update", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+@require_authorization
+def system_update():
+    """Trigger manual update check and in-place daemon restart."""
+    if request.method == "OPTIONS":
+        return "", 204
+    updater = current_app.extensions.get("updater")
+    if not updater:
+        return jsonify({"error": "Auto-updater not initialized or not in a git repository."}), 400
+    has_update, local_sha, remote_sha = updater.check_update()
+    if has_update:
+        Thread(target=updater.apply_update_and_restart, args=(local_sha, remote_sha), daemon=True).start()
+        return jsonify({"updating": True, "local_commit": local_sha, "remote_commit": remote_sha}), 202
+    return jsonify({"updating": False, "local_commit": local_sha, "remote_commit": remote_sha}), 200
+
+
 @api.route("/api/update", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 @require_authorization
 def update_all_servers():
