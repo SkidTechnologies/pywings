@@ -51,6 +51,7 @@ class Settings:
     remote: str = ""
     version: str = "0.1.0"
     config_path: Path = DEFAULT_CONFIG_PATH
+    proot_path: str = ""
 
     @classmethod
     def from_file(cls, path: Path = DEFAULT_CONFIG_PATH) -> "Settings":
@@ -71,6 +72,12 @@ class Settings:
         if not data_directory.is_absolute():
             data_directory = path.parent / data_directory
 
+        proot_path_val = (
+            os.getenv("PROOT_PATH")
+            or os.getenv("PROOT_BIN")
+            or str(system.get("proot_path") or "")
+        )
+
         return cls(
             debug=_env_bool("WINGS_DEBUG", bool(values.get("debug", False))),
             uuid=str(_env("WINGS_UUID", values.get("uuid", ""))),
@@ -88,6 +95,7 @@ class Settings:
             remote=str(_env("WINGS_REMOTE", values.get("remote", ""))),
             version=str(_env("WINGS_VERSION", "0.1.0")),
             config_path=path,
+            proot_path=proot_path_val,
         )
 
     def as_flask_config(self) -> dict[str, object]:
@@ -108,4 +116,5 @@ class Settings:
             "SFTP_BIND_PORT": self.sftp_bind_port,
             "ALLOWED_MOUNTS": self.allowed_mounts,
             "CONFIG_PATH": str(self.config_path),
+            "PROOT_PATH": self.proot_path,
         }

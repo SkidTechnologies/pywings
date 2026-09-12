@@ -12,7 +12,7 @@ from wings.config import Settings
 from wings.logger import setup_logging
 from wings.servers import ServerStore
 from wings.processes import ProcessManager
-from wings.runtime import UdockerRuntime
+from wings.runtime import ProotRuntime
 from wings.remote import PanelRemoteClient
 
 
@@ -38,10 +38,10 @@ def create_app(settings: Settings | None = None) -> Flask:
         app.config["PANEL_LOCATION"], app.config["TOKEN_ID"], app.config["TOKEN"]
     )
     app.extensions["remote_client"] = remote_client
-
-    from wings.runtime import PyDockerRuntime
-    runtime = PyDockerRuntime(data_directory=app.config["DATA_DIRECTORY"])
-
+    runtime_data_dir = Path(app.config["DATA_DIRECTORY"]).resolve() / "runtime"
+    proot_custom_path = app.config.get("PROOT_PATH") or None
+    runtime = ProotRuntime(data_directory=runtime_data_dir, proot_path=proot_custom_path)
+    app.extensions["container_runtime"] = runtime
     app.extensions["process_manager"] = ProcessManager(
         app.extensions["server_store"],
         runtime,
