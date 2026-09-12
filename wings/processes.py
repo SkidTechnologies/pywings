@@ -133,9 +133,14 @@ class ProcessManager:
                 bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server is currently installing, cannot start.")
                 return
 
-            if self.is_running(server_uuid) or current_state in {STATE_STARTING, STATE_RUNNING}:
-                logger.info("Server %s is already starting or running; ignoring start request", server_uuid)
+            if self.is_running(server_uuid):
+                logger.info("Server %s is already running; ignoring start request", server_uuid)
                 return
+
+            # Self-healing: if marked as starting or running but no process actually exists, reset to offline
+            if current_state in {STATE_STARTING, STATE_RUNNING}:
+                logger.warning("Server %s was marked as %s but has no active process; recovering state to offline", server_uuid, current_state)
+                self.set_server_state(server_uuid, STATE_OFFLINE)
 
             if current_state == STATE_STOPPING:
                 logger.info("Server %s is currently stopping; waiting before restart", server_uuid)
@@ -155,81 +160,124 @@ class ProcessManager:
             self._start_locked(server_uuid, configuration)
 
     def _start_locked(self, server_uuid: str, configuration: dict) -> None:
-        self.set_server_state(server_uuid, STATE_STARTING)
-        bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Preparing server environment for boot...")
+        try:
+            self.set_server_state(server_uuid, STATE_STARTING)
+            bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Preparing server environment for boot...")
 
-        # If configuration is missing container.image, fetch fresh config from Panel or store
-        if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
-            if self.remote_client:
-                try:
-                    fresh_conf = self.remote_client.get_server_configuration(server_uuid)
-                    if isinstance(fresh_conf, dict) and fresh_conf:
-                        configuration.update(fresh_conf)
-                        self.store.update_configuration(server_uuid, configuration)
-                except Exception as err:
-                    logger.warning("Could not refresh configuration from Panel for %s: %s", server_uuid, err)
+            # Clean up any lingering zombie processes from previous boots
+            self._cleanup_server_pids(server_uuid)
+
+            # If configuration is missing container.image, fetch fresh config from Panel or store
             if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
-                stored = self.store.get(server_uuid)
-                if stored and stored.configuration:
-                    configuration.update(stored.configuration)
+                if self.remote_client:
+                    try:
+                        fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                        if isinstance(fresh_conf, dict) and fresh_conf:
+                            configuration.update(fresh_conf)
+                            self.store.update_configuration(server_uuid, configuration)
+                    except Exception as err:
+                        logger.warning("Could not refresh configuration from Panel for %s: %s", server_uuid, err)
+                if not (configuration.get("container") or {}).get("image") and not configuration.get("image"):
+                    stored = self.store.get(server_uuid)
+                    if stored and stored.configuration:
+                        configuration.update(stored.configuration)
 
-        image = self.validate_configuration(configuration)
-        environment = self._environment(configuration)
-        self._apply_java_environment(image, environment)
+            image = self.validate_configuration(configuration)
+            environment = self._environment(configuration)
+            self._apply_java_environment(image, environment)
 
-        # Update process configuration files before booting
+            # Update process configuration files before booting
+            server_root = (self.store.data_directory / server_uuid).resolve()
+            server_root.mkdir(parents=True, exist_ok=True)
+            try:
+                ConfigParser(server_root, configuration, environment).update_configuration_files()
+            except Exception as err:
+                logger.warning("Failed updating config files for %s: %s", server_uuid, err)
+
+            invocation = self._startup(configuration, environment)
+            environment["STARTUP"] = invocation
+            logger.info("Server %s booting with command: %s", server_uuid, invocation)
+            command = ["/bin/sh", "-c", f"exec {invocation}"]
+            volumes = self._volumes(server_uuid, configuration)
+            publishes = []
+            workdir, user = self._runtime_identity(configuration)
+            entrypoint = self._entrypoint(configuration)
+            command, entrypoint = self._adapt_reviactyl_entrypoint(image, command, entrypoint)
+
+            try:
+                self.runtime.pull(image)
+            except RuntimeCommandError as error:
+                logger.warning("Failed pulling image %s: %s", image, error)
+
+            try:
+                self.runtime.create(server_uuid, image)
+            except RuntimeCommandError as error:
+                msg = str(error).lower()
+                if "already exists" not in msg and "already used" not in msg:
+                    raise
+
+            process = self.runtime.start_async(
+                server_uuid,
+                command,
+                environment=environment,
+                volumes=volumes,
+                publishes=publishes,
+                workdir=workdir,
+                user=user,
+                entrypoint=entrypoint,
+            )
+
+            with self._lock:
+                self._processes[server_uuid] = process
+                self._started_at[server_uuid] = time.monotonic()
+                self._net_baseline[server_uuid] = self._read_network_bytes()
+
+            bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server process started.")
+            Thread(target=self._watch, args=(server_uuid, process, configuration), daemon=True).start()
+            Thread(
+                target=self._enforce_limits,
+                args=(server_uuid, process, configuration),
+                daemon=True,
+            ).start()
+
+        except Exception as boot_err:
+            logger.error("Failed booting server %s: %s", server_uuid, boot_err, exc_info=True)
+            self.set_server_state(server_uuid, STATE_OFFLINE)
+            bus.publish(server_uuid, DaemonMessageEvent, f"[Wings Daemon]: Failed to boot server: {boot_err}")
+            bus.publish(server_uuid, ConsoleOutputEvent, f"container@pterodactyl~ Server boot failed: {boot_err}")
+
+    def _cleanup_server_pids(self, server_uuid: str) -> None:
+        """Kill any zombie or orphaned processes from previous runs of this server before boot."""
         server_root = (self.store.data_directory / server_uuid).resolve()
-        server_root.mkdir(parents=True, exist_ok=True)
-        try:
-            ConfigParser(server_root, configuration, environment).update_configuration_files()
-        except Exception as err:
-            logger.warning("Failed updating config files for %s: %s", server_uuid, err)
-
-        invocation = self._startup(configuration, environment)
-        environment["STARTUP"] = invocation
-        logger.info("Server %s booting with command: %s", server_uuid, invocation)
-        command = ["/bin/sh", "-c", f"exec {invocation}"]
-        volumes = self._volumes(server_uuid, configuration)
-        publishes = []
-        workdir, user = self._runtime_identity(configuration)
-        entrypoint = self._entrypoint(configuration)
-        command, entrypoint = self._adapt_reviactyl_entrypoint(image, command, entrypoint)
-
-        try:
-            self.runtime.pull(image)
-        except RuntimeCommandError as error:
-            logger.warning("Failed pulling image %s: %s", image, error)
-
-        try:
-            self.runtime.create(server_uuid, image)
-        except RuntimeCommandError as error:
-            msg = str(error).lower()
-            if "already exists" not in msg and "already used" not in msg:
-                raise
-
-        process = self.runtime.start_async(
-            server_uuid,
-            command,
-            environment=environment,
-            volumes=volumes,
-            publishes=publishes,
-            workdir=workdir,
-            user=user,
-            entrypoint=entrypoint,
-        )
-
-        with self._lock:
-            self._processes[server_uuid] = process
-            self._started_at[server_uuid] = time.monotonic()
-            self._net_baseline[server_uuid] = self._read_network_bytes()
-
-        bus.publish(server_uuid, DaemonMessageEvent, "[Wings Daemon]: Server process started.")
-        Thread(target=self._watch, args=(server_uuid, process, configuration), daemon=True).start()
-        Thread(
-            target=self._enforce_limits,
-            args=(server_uuid, process, configuration),
-            daemon=True,
-        ).start()
+        if not os.path.exists("/proc"):
+            return
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            p = int(entry)
+            if p <= 1 or p == os.getpid():
+                continue
+            try:
+                is_target = False
+                env_file = Path(f"/proc/{p}/environ")
+                if env_file.is_file():
+                    try:
+                        if f"SERVER_UUID={server_uuid}".encode() in env_file.read_bytes():
+                            is_target = True
+                    except OSError:
+                        pass
+                if not is_target:
+                    try:
+                        cwd_path = Path(f"/proc/{p}/cwd").resolve()
+                        if cwd_path == server_root or server_root in cwd_path.parents:
+                            is_target = True
+                    except OSError:
+                        pass
+                if is_target:
+                    logger.info("Cleaning up lingering zombie process %d before booting %s", p, server_uuid)
+                    os.kill(p, signal.SIGKILL)
+            except (OSError, ValueError, IndexError):
+                pass
 
     def _wait_for_offline(self, server_uuid: str, timeout: int = 15) -> None:
         deadline = time.monotonic() + timeout
