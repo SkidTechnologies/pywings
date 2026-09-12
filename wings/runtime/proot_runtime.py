@@ -159,11 +159,20 @@ class ProotRuntime(ContainerRuntime):
         self.validate_safe_bindings(volumes)
         proot_bin = self.proot_path or ProotDetector.find_proot()
         cont_cwd = workdir or "/home/container"
+        rf_path = Path(rootfs).resolve()
+
+        # Ensure fundamental container mount points and directories exist
+        for d in ("dev", "proc", "sys", "tmp", "etc", "mnt"):
+            try:
+                (rf_path / d).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
         cmd = [
             str(proot_bin),
-            "-0",
-            "-r", str(Path(rootfs).resolve()),
+            "-n",   # Pure ptrace mode: disables seccomp acceleration, avoiding PTRACE_O_TRACESECCOMP collision
+            "-0",   # Root emulation (UID 0 / GID 0 inside jail)
+            "-r", str(rf_path),
             "-w", cont_cwd,
         ]
 
@@ -171,6 +180,20 @@ class ProotRuntime(ContainerRuntime):
         for sys_mount in ("/dev", "/proc", "/sys"):
             if os.path.exists(sys_mount):
                 cmd.extend(["-b", sys_mount])
+
+        # Bind network configuration if present on host
+        if os.path.exists("/etc/resolv.conf"):
+            try:
+                (rf_path / "etc" / "resolv.conf").touch(exist_ok=True)
+                cmd.extend(["-b", "/etc/resolv.conf:/etc/resolv.conf"])
+            except OSError:
+                pass
+        if os.path.exists("/etc/hosts"):
+            try:
+                (rf_path / "etc" / "hosts").touch(exist_ok=True)
+                cmd.extend(["-b", "/etc/hosts:/etc/hosts"])
+            except OSError:
+                pass
 
         for vol in volumes:
             if ":" in vol:
@@ -266,6 +289,7 @@ class ProotRuntime(ContainerRuntime):
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "PROOT_NO_SECCOMP": "1",    # Prevents ptrace seccomp collision in nested containers
             "PROOT_NO_SUBRECONF": "1",
+            "GLIBC_TUNABLES": "glibc.pthread.rseq=0",  # Prevents glibc 2.35+ (Ubuntu 22/Debian 12) SIGSEGV under PRoot
             "PYTHONUNBUFFERED": "1",
         }
 
