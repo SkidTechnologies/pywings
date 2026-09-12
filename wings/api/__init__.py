@@ -5,17 +5,17 @@ container-specific details will be added with the udocker adapter.
 """
 
 from functools import wraps
+import http.client
 import json
 import logging
 import os
-import platform
 from pathlib import Path
+import platform
 from queue import Empty
-from threading import Lock
-from threading import Thread
+from threading import Lock, Thread
+import time
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-import http.client
 import uuid
 
 from flask import Blueprint, current_app, jsonify, request, send_file

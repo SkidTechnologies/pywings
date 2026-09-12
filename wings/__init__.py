@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     try:
         from wings.sftp import SFTPServer
         sftp_server = SFTPServer(
-            host=app.config.get("HOST", "0.0.0.0"),
+            host=app.config.get("SFTP_BIND_ADDRESS", "0.0.0.0"),
             port=int(app.config.get("SFTP_BIND_PORT", 2022)),
             data_directory=app.config["DATA_DIRECTORY"],
             remote_client=remote_client,

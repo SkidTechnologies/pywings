@@ -47,6 +47,7 @@ class Settings:
     upload_limit: int = 100
     data_directory: str = "./data"
     sftp_bind_port: int = 2022
+    sftp_bind_address: str = "0.0.0.0"
     allowed_mounts: tuple[str, ...] = ()
     remote: str = ""
     version: str = "0.1.0"
@@ -78,12 +79,18 @@ class Settings:
             or str(system.get("proot_path") or "")
         )
 
+        raw_host = str(_env("WINGS_HOST", api.get("host", "0.0.0.0")))
+        clean_host = raw_host.partition(":")[0] if ":" in raw_host and not raw_host.startswith("[") else raw_host
+
+        raw_sftp_address = str(sftp.get("bind_address") or "0.0.0.0")
+        clean_sftp_address = raw_sftp_address.partition(":")[0] if ":" in raw_sftp_address and not raw_sftp_address.startswith("[") else raw_sftp_address
+
         return cls(
             debug=_env_bool("WINGS_DEBUG", bool(values.get("debug", False))),
             uuid=str(_env("WINGS_UUID", values.get("uuid", ""))),
             token_id=str(_env("WINGS_TOKEN_ID", values.get("token_id", ""))),
             token=str(_env("WINGS_TOKEN", values.get("token", ""))),
-            host=str(_env("WINGS_HOST", api.get("host", "0.0.0.0"))),
+            host=clean_host,
             port=_env_int("WINGS_PORT", int(api.get("port", 8080))),
             ssl_enabled=_env_bool("WINGS_SSL_ENABLED", bool(ssl.get("enabled", False))),
             ssl_cert=str(_env("WINGS_SSL_CERT", ssl.get("cert", ""))),
@@ -91,6 +98,7 @@ class Settings:
             upload_limit=int(api.get("upload_limit", 100)),
             data_directory=str(data_directory.resolve()),
             sftp_bind_port=int(sftp.get("bind_port", 2022)),
+            sftp_bind_address=clean_sftp_address,
             allowed_mounts=tuple(str(item) for item in (sftp.get("allowed_mounts") or [])),
             remote=str(_env("WINGS_REMOTE", values.get("remote", ""))),
             version=str(_env("WINGS_VERSION", "0.1.0")),
@@ -114,6 +122,7 @@ class Settings:
             "UPLOAD_LIMIT": self.upload_limit,
             "DATA_DIRECTORY": self.data_directory,
             "SFTP_BIND_PORT": self.sftp_bind_port,
+            "SFTP_BIND_ADDRESS": self.sftp_bind_address,
             "ALLOWED_MOUNTS": self.allowed_mounts,
             "CONFIG_PATH": str(self.config_path),
             "PROOT_PATH": self.proot_path,
