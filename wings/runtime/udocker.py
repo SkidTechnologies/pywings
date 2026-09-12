@@ -132,12 +132,17 @@ class UdockerRuntime:
             options.append(f"--entrypoint={entrypoint}")
         full_cmd = self._command("run", *options, container, *command)
         logger.info("Starting container %s: %s", container, " ".join(full_cmd))
+        proc_env = dict(os.environ)
+        proc_env.setdefault("PROOT_NO_SECCOMP", "1")
+        proc_env["PYTHONUNBUFFERED"] = "1"
         return subprocess.Popen(
             full_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
+            env=proc_env,
             shell=False,
         )
 

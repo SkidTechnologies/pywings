@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from typing import Any
 
@@ -25,12 +25,31 @@ class PanelRemoteClient:
             self.endpoint = self.base_url
         self.token_id = token_id
         self.token = token
+        self.fallback_base_urls: list[str] = []
         self._update_auth()
 
     def set_credentials(self, token_id: str, token: str) -> None:
         self.token_id = token_id
         self.token = token
         self._update_auth()
+
+    def add_fallback_host(self, host: str) -> None:
+        """Register host or IP observed from incoming authenticated Panel requests."""
+        if not host:
+            return
+        if ":" in host and not host.startswith("["):
+            host_clean = host.split(":", 1)[0]
+        else:
+            host_clean = host
+        if host_clean in {"127.0.0.1", "::1", "localhost"}:
+            return
+        parsed = urlparse(self.base_url)
+        scheme = parsed.scheme or "http"
+        port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+        candidate = f"{scheme}://{host_clean}{port_str}".rstrip("/")
+        if candidate != self.base_url and candidate not in self.fallback_base_urls:
+            logger.info("Registered potential Panel fallback URL from incoming request: %s", candidate)
+            self.fallback_base_urls.append(candidate)
 
     def _update_auth(self) -> None:
         if self.token_id and self.token:
@@ -100,23 +119,50 @@ class PanelRemoteClient:
                     ) from error
                 time.sleep(1.0 * attempt)
             except (URLError, TimeoutError, OSError) as error:
+                last_error = error
                 if attempt == retries:
                     logger.warning(
-                        "Panel API %s %s request failed after %d attempts: %s",
+                        "Panel API %s %s request attempt %d failed: %s",
                         method,
                         path,
-                        retries,
+                        attempt,
                         error,
                     )
-                    raise PanelRemoteError(f"Panel API {method} {path} connection failed: {error}") from error
-                logger.debug(
-                    "Panel API %s %s attempt %d failed (%s), retrying...",
-                    method,
-                    path,
-                    attempt,
-                    error,
-                )
-                time.sleep(1.0 * attempt)
+                else:
+                    logger.debug(
+                        "Panel API %s %s attempt %d failed (%s), retrying...",
+                        method,
+                        path,
+                        attempt,
+                        error,
+                    )
+                    time.sleep(1.0 * attempt)
+
+        # If primary endpoint failed, attempt fallback URLs if available
+        if self.fallback_base_urls:
+            for fallback in list(self.fallback_base_urls):
+                logger.info("Attempting Panel request via fallback address %s...", fallback)
+                fallback_endpoint = f"{fallback}/api/remote"
+                fallback_url = f"{fallback_endpoint}/{path.lstrip('/')}"
+                if query:
+                    fallback_url = f"{fallback_url}?{urlencode(query)}"
+                fallback_req = Request(fallback_url, data=body, headers=headers, method=method)
+                try:
+                    with urlopen(fallback_req, timeout=timeout) as response:
+                        raw = response.read().decode("utf-8")
+                        logger.info("Successfully connected to Panel via fallback %s! Updating primary endpoint.", fallback)
+                        self.base_url = fallback
+                        self.endpoint = fallback_endpoint
+                        if not raw.strip():
+                            return None
+                        try:
+                            return json.loads(raw)
+                        except json.JSONDecodeError:
+                            return raw
+                except Exception as fb_err:
+                    logger.warning("Fallback connection to %s failed: %s", fallback, fb_err)
+
+        raise PanelRemoteError(f"Panel API {method} {path} connection failed: {last_error}") from last_error
 
     def get_server_configuration(self, server_uuid: str) -> dict:
         """Fetch server settings and process configuration from the Panel."""

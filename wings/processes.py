@@ -341,10 +341,14 @@ class ProcessManager:
                         for line in process.stdout:
                             log_f.write(line)
                             log_f.flush()
-                            bus.publish(server_uuid, InstallOutputEvent, line.rstrip("\r\n"))
+                            clean = line.rstrip("\r\n")
+                            logger.info("[installer:%s] %s", server_uuid[:8], clean)
+                            bus.publish(server_uuid, InstallOutputEvent, clean)
+                            bus.publish(server_uuid, ConsoleOutputEvent, clean)
 
                 exit_code = process.wait()
                 successful = exit_code == 0
+                logger.info("Installer process for %s exited with code %d (successful=%s)", server_uuid, exit_code, successful)
             except Exception as err:
                 logger.error("Installation failed with error on server %s: %s", server_uuid, err)
                 successful = False

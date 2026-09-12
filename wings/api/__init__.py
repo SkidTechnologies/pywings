@@ -60,6 +60,12 @@ def require_authorization(view):
         expected = current_app.config.get("TOKEN", "")
         if not expected or auth[1] != expected:
             return jsonify({"error": "You are not authorized to access this endpoint."}), 403
+
+        # Authenticated Panel request received -> capture client IP as fallback in case configured remote is unreachable
+        remote_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        if remote_ip and "remote_client" in current_app.extensions:
+            current_app.extensions["remote_client"].add_fallback_host(remote_ip)
+
         return view(*args, **kwargs)
 
     return wrapped
@@ -1017,8 +1023,6 @@ def register_websocket(sock) -> None:
                     continue
 
                 perms = claims.get("permissions", [])
-                if evt == "install output" and "admin.websocket.install" not in perms and "*" not in perms:
-                    continue
                 if evt == "transfer logs" and "admin.websocket.transfer" not in perms and "*" not in perms:
                     continue
 
