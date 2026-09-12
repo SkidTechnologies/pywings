@@ -491,11 +491,6 @@ class ProcessManager:
                 f"elif [ -x /bin/ash ]; then exec /bin/ash /mnt/install/install.sh; "
                 f"else exec sh /mnt/install/install.sh; fi"
             )
-                f"elif [ -x /bin/sh ]; then exec /bin/sh /mnt/install/install.sh; "
-                f"elif [ -x /usr/bin/sh ]; then exec /usr/bin/sh /mnt/install/install.sh; "
-                f"elif [ -x /bin/ash ]; then exec /bin/ash /mnt/install/install.sh; "
-                f"else exec sh /mnt/install/install.sh; fi"
-            )
             command = ["/bin/sh", "-c", install_cmd]
             command, run_entrypoint = self._adapt_reviactyl_entrypoint(container_image, command, "")
 
