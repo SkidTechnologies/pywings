@@ -286,7 +286,7 @@ class PanelRemoteClient:
         if not activity:
             return
         try:
-            self._request("POST", "/activity", data=activity)
+            self._request("POST", "/activity", data={"data": activity})
         except PanelRemoteError as error:
             logger.warning("Failed to send activity logs to Panel: %s", error)
 

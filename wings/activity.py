@@ -1,6 +1,7 @@
 """Activity event manager and periodic flusher to Pterodactyl Panel."""
 
 from datetime import datetime, timezone
+import ipaddress
 import logging
 import threading
 import time
@@ -8,6 +9,21 @@ from typing import Any
 
 
 logger = logging.getLogger("wings.activity")
+
+
+def _sanitize_ip(ip: str | None) -> str:
+    if not ip:
+        return "127.0.0.1"
+    raw = str(ip).strip()
+    if raw.startswith("[") and "]" in raw:
+        raw = raw.split("]")[0].lstrip("[")
+    elif raw.count(":") == 1:
+        raw = raw.split(":")[0]
+    try:
+        ipaddress.ip_address(raw)
+        return raw
+    except ValueError:
+        return "127.0.0.1"
 
 
 class ActivityManager:
@@ -40,16 +56,18 @@ class ActivityManager:
         event: str,
         metadata: dict | None = None,
         ip: str = "127.0.0.1",
+        user: str | None = None,
     ) -> None:
         """Record an activity event for a server instance."""
         if not server_uuid or not event:
             return
         entry = {
+            "user": user,
             "server": server_uuid,
             "event": event,
             "metadata": metadata or {},
-            "ip": ip or "127.0.0.1",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ip": _sanitize_ip(ip),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         with self._lock:
             self._queue.append(entry)
