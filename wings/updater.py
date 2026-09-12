@@ -47,10 +47,15 @@ def get_local_version() -> str:
 
 
 def get_remote_version(timeout: int = 5) -> str | None:
-    """Fetch remote version from GitHub version.txt."""
+    """Fetch remote version from GitHub version.txt with cache busting."""
+    url = f"{REMOTE_VERSION_URL}?_t={int(time.time())}"
     req = urllib.request.Request(
-        REMOTE_VERSION_URL,
-        headers={"User-Agent": "pywings-autoupdater/1.0", "Cache-Control": "no-cache"},
+        url,
+        headers={
+            "User-Agent": "pywings-autoupdater/1.0",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -59,24 +64,26 @@ def get_remote_version(timeout: int = 5) -> str | None:
                 if content:
                     return content
     except Exception as err:
-        logger.debug("Failed fetching remote version from %s: %s", REMOTE_VERSION_URL, err)
+        logger.debug("Failed fetching remote version from %s: %s", url, err)
     return None
 
 
 def download_and_extract_archive(dest_dir: Path) -> bool:
     """Download ZIP archive from GitHub and extract files directly into destination directory."""
+    print(f"[INFO] [updater] Downloading latest code from {REMOTE_ARCHIVE_URL}...", flush=True)
     req = urllib.request.Request(
         REMOTE_ARCHIVE_URL,
         headers={"User-Agent": "pywings-autoupdater/1.0"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             if resp.status != 200:
+                print(f"[ERROR] [updater] GitHub archive download returned status {resp.status}", flush=True)
                 return False
             data = resp.read()
 
+        print(f"[INFO] [updater] Archive downloaded ({len(data)} bytes). Extracting files...", flush=True)
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            # GitHub zips put all files inside a root folder like 'pywings-main/'
             members = z.infolist()
             if not members:
                 return False
@@ -89,6 +96,10 @@ def download_and_extract_archive(dest_dir: Path) -> bool:
                 if not rel_path:
                     continue
 
+                # Protect user configuration and server data
+                if rel_path == "config.yml" or rel_path.startswith("data/"):
+                    continue
+
                 target_file = dest_dir / rel_path
                 if member.is_dir():
                     target_file.mkdir(parents=True, exist_ok=True)
@@ -97,9 +108,10 @@ def download_and_extract_archive(dest_dir: Path) -> bool:
                     with z.open(member) as src, open(target_file, "wb") as dst:
                         shutil.copyfileobj(src, dst)
 
+        print("[INFO] [updater] Extraction completed successfully.", flush=True)
         return True
     except Exception as err:
-        logger.error("Failed downloading/extracting GitHub archive: %s", err)
+        print(f"[ERROR] [updater] Failed downloading/extracting GitHub archive: {err}", flush=True)
         return False
 
 
@@ -108,8 +120,7 @@ def apply_update_from_github(repo_dir: Path, branch: str = "main") -> bool:
     has_git = (repo_dir / ".git").is_dir()
 
     if has_git:
-        # Prefer git pull / reset
-        logger.info("Updating via Git from origin/%s...", branch)
+        print(f"[INFO] [updater] Updating via Git from origin/{branch}...", flush=True)
         res = subprocess.run(
             ["git", "fetch", "origin", branch],
             cwd=str(repo_dir),
@@ -126,44 +137,45 @@ def apply_update_from_github(repo_dir: Path, branch: str = "main") -> bool:
                 check=False,
             )
             if reset_res.returncode == 0:
-                logger.info("Git reset to origin/%s succeeded.", branch)
+                print(f"[INFO] [updater] Git reset to origin/{branch} succeeded.", flush=True)
                 return True
 
-    # Fallback to direct zip download and overwrite
-    logger.info("Updating via direct GitHub archive download (%s)...", REMOTE_ARCHIVE_URL)
+    # Direct zip download fallback (works for standalone unzipped pywings-main without .git)
     return download_and_extract_archive(repo_dir)
 
 
 def check_and_update_on_launch() -> None:
     """Called at application launch to immediately upgrade to newer GitHub version if available."""
     local_ver = get_local_version()
-    remote_ver = get_remote_version(timeout=6)
+    print(f"[INFO] [updater] Checking GitHub for updates (local version: v{local_ver})...", flush=True)
 
+    remote_ver = get_remote_version(timeout=6)
     if not remote_ver:
-        logger.info("pywings running version %s (offline / could not reach GitHub update check)", local_ver)
+        print(f"[INFO] [updater] GitHub check unavailable; running local version v{local_ver}", flush=True)
         return
 
+    print(f"[INFO] [updater] GitHub version: v{remote_ver} | Local version: v{local_ver}", flush=True)
     if parse_version(remote_ver) > parse_version(local_ver):
-        logger.info("=" * 60)
-        logger.info("NEW PYWINGS UPDATE FOUND: v%s (current: v%s)", remote_ver, local_ver)
-        logger.info("Downloading and applying update from GitHub...")
-        logger.info("=" * 60)
+        print("=" * 60, flush=True)
+        print(f"[INFO] [updater] NEW UPDATE AVAILABLE: v{remote_ver} (current: v{local_ver})", flush=True)
+        print("[INFO] [updater] Downloading and applying update from GitHub...", flush=True)
+        print("=" * 60, flush=True)
 
         success = apply_update_from_github(PROJECT_ROOT)
         if success:
-            logger.info("Update to v%s applied successfully! Relaunching pywings...", remote_ver)
+            print(f"[INFO] [updater] Successfully updated to v{remote_ver}! Relaunching pywings...", flush=True)
             time.sleep(1)
             python_bin = sys.executable
             args = [python_bin] + sys.argv
             try:
                 os.execv(python_bin, args)
             except Exception as err:
-                logger.error("os.execv failed: %s; exiting for systemd/supervisor restart", err)
+                print(f"[ERROR] [updater] os.execv failed: {err}; exiting for process restart", flush=True)
                 sys.exit(0)
         else:
-            logger.warning("Update failed; continuing with current version %s", local_ver)
+            print(f"[WARN] [updater] Update could not be applied; continuing with current version v{local_ver}", flush=True)
     else:
-        logger.info("pywings is up-to-date (v%s)", local_ver)
+        print(f"[INFO] [updater] pywings is up-to-date (v{local_ver})", flush=True)
 
 
 class AutoUpdater:
