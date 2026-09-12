@@ -1017,13 +1017,15 @@ def register_websocket(sock) -> None:
                 except Exception:
                     pass
 
+        app = current_app._get_current_object()
+
         def send_stats() -> None:
             try:
-                stats_json = json.dumps(
-                    current_app.extensions["process_manager"].stats(server_uuid),
-                    separators=(",", ":"),
-                )
-                safe_send("stats", [stats_json])
+                manager = app.extensions.get("process_manager")
+                if manager:
+                    stats_data = manager.stats(server_uuid)
+                    stats_json = json.dumps(stats_data, separators=(",", ":"))
+                    safe_send("stats", [stats_json])
             except Exception:
                 pass
 
@@ -1049,10 +1051,16 @@ def register_websocket(sock) -> None:
 
                 safe_send(evt, msg.get("args", []))
 
+        def stats_streamer():
+            while active:
+                if authenticated:
+                    send_stats()
+                time.sleep(1.0)
+
         pump_thread = Thread(target=event_pump, daemon=True)
         pump_thread.start()
-
-        app = current_app._get_current_object()
+        stats_thread = Thread(target=stats_streamer, daemon=True)
+        stats_thread.start()
 
         try:
             while True:

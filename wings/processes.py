@@ -79,6 +79,8 @@ class ProcessManager:
         self._started_at: dict[str, float] = {}
         self._server_locks: dict[str, RLock] = {}
         self._last_crash: dict[str, float] = {}
+        self._cpu_history: dict[str, tuple[float, int]] = {}
+        self._disk_cache: dict[str, tuple[float, int]] = {}
         self._lock = RLock()
 
     def _get_server_lock(self, server_uuid: str) -> RLock:
@@ -931,7 +933,7 @@ class ProcessManager:
 
         pid = getattr(process, "pid", None)
         memory_bytes = self._linux_rss(pid)
-        cpu_absolute = self._linux_cpu_percent(pid)
+        cpu_absolute = self._linux_cpu_percent(server_uuid, pid)
         return {
             "memory_bytes": memory_bytes,
             "memory_limit_bytes": memory_limit,
@@ -943,41 +945,92 @@ class ProcessManager:
         }
 
     def _disk_usage(self, server_uuid: str) -> int:
+        now = time.monotonic()
+        cached = self._disk_cache.get(server_uuid)
+        if cached and (now - cached[0] < 15.0):
+            return cached[1]
+
         root = self.store.data_directory / server_uuid
         if not root.exists():
             return 0
         total = 0
-        for path in root.rglob("*"):
-            if path.is_file():
-                try:
-                    total += path.stat().st_size
-                except OSError:
-                    pass
+        try:
+            for path in root.rglob("*"):
+                if path.is_file():
+                    try:
+                        total += path.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        self._disk_cache[server_uuid] = (now, total)
         return total
 
     @staticmethod
-    def _linux_rss(pid) -> int:
-        if not pid or not Path("/proc").exists():
-            return 0
+    def _process_pids(root_pid: int | None) -> list[int]:
+        """Find root PID and all child/descendant PIDs in /proc."""
+        if not root_pid or not os.path.exists("/proc"):
+            return []
+        pids = {root_pid}
         try:
-            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
-        except (OSError, ValueError, IndexError):
+            for entry in os.listdir("/proc"):
+                if entry.isdigit() and int(entry) not in pids:
+                    try:
+                        stat_text = Path(f"/proc/{entry}/stat").read_text()
+                        rparen = stat_text.rfind(")")
+                        if rparen != -1:
+                            parts = stat_text[rparen + 1:].split()
+                            ppid = int(parts[1])
+                            if ppid in pids:
+                                pids.add(int(entry))
+                    except Exception:
+                        continue
+        except Exception:
             pass
-        return 0
+        return list(pids)
 
-    @staticmethod
-    def _linux_cpu_percent(pid) -> float:
-        if not pid or not Path("/proc").exists():
+    def _linux_rss(self, pid: int | None) -> int:
+        if not pid or not os.path.exists("/proc"):
+            return 0
+        total_rss = 0
+        for p in self._process_pids(pid):
+            try:
+                for line in Path(f"/proc/{p}/status").read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        total_rss += int(line.split()[1]) * 1024
+                        break
+            except (OSError, ValueError, IndexError):
+                pass
+        return total_rss
+
+    def _linux_cpu_percent(self, server_uuid: str, pid: int | None) -> float:
+        if not pid or not os.path.exists("/proc"):
             return 0.0
+        now = time.monotonic()
+        total_ticks = 0
         try:
-            fields = Path(f"/proc/{pid}/stat").read_text().split()
-            process_ticks = int(fields[13]) + int(fields[14])
             clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-            uptime = float(Path("/proc/uptime").read_text().split()[0])
-            start_ticks = int(fields[21])
-            process_uptime = max(0.01, uptime - (start_ticks / clock_ticks))
-            return round((process_ticks / clock_ticks) / process_uptime * 100, 2)
-        except (OSError, ValueError, IndexError, KeyError, ZeroDivisionError):
+        except (AttributeError, KeyError, ValueError):
+            clock_ticks = 100
+
+        for p in self._process_pids(pid):
+            try:
+                stat_text = Path(f"/proc/{p}/stat").read_text()
+                rparen = stat_text.rfind(")")
+                if rparen != -1:
+                    parts = stat_text[rparen + 1:].split()
+                    # utime (index 11) + stime (index 12)
+                    total_ticks += int(parts[11]) + int(parts[12])
+            except (OSError, ValueError, IndexError):
+                pass
+
+        last = self._cpu_history.get(server_uuid)
+        self._cpu_history[server_uuid] = (now, total_ticks)
+        if not last:
             return 0.0
+
+        last_time, last_ticks = last
+        delta_time = max(0.1, now - last_time)
+        delta_ticks = max(0, total_ticks - last_ticks)
+        cpu_usage = (delta_ticks / clock_ticks) / delta_time * 100.0
+        return round(cpu_usage, 2)
