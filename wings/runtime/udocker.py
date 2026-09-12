@@ -1,11 +1,15 @@
 """Small, testable wrapper around the udocker command line interface."""
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import shutil
 import subprocess
 from typing import Callable, Sequence
+
+
+logger = logging.getLogger("wings.udocker")
 
 
 class RuntimeError(Exception):
@@ -66,6 +70,7 @@ class UdockerRuntime:
             )
 
         command = self._command(*args)
+        logger.debug("Executing udocker command: %s", " ".join(command))
         result = self._runner(
             command,
             capture_output=True,
@@ -81,7 +86,9 @@ class UdockerRuntime:
         )
         if check and result.returncode != 0:
             message = result.stderr.strip() or result.stdout.strip() or "unknown udocker error"
+            logger.warning("udocker command exited with code %d: %s", result.returncode, message)
             raise RuntimeCommandError(f"udocker command failed ({result.returncode}): {message}")
+        logger.debug("udocker command completed successfully (code=%d)", result.returncode)
         return normalized
 
     def version(self) -> CommandResult:
@@ -123,8 +130,10 @@ class UdockerRuntime:
             options.append(f"--user={user}")
         if entrypoint is not None:
             options.append(f"--entrypoint={entrypoint}")
+        full_cmd = self._command("run", *options, container, *command)
+        logger.info("Starting container %s: %s", container, " ".join(full_cmd))
         return subprocess.Popen(
-            self._command("run", *options, container, *command),
+            full_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

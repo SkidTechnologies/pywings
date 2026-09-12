@@ -3,14 +3,21 @@
 from flask import Flask, request
 from flask_sock import Sock
 from pathlib import Path
-import uuid
+import logging
 import os
+import time
+import uuid
 
 from wings.config import Settings
+from wings.logger import setup_logging
 from wings.servers import ServerStore
 from wings.processes import ProcessManager
 from wings.runtime import UdockerRuntime
 from wings.remote import PanelRemoteClient
+
+
+logger = logging.getLogger("wings")
+http_logger = logging.getLogger("wings.http")
 
 
 def create_app(settings: Settings | None = None) -> Flask:
@@ -21,6 +28,10 @@ def create_app(settings: Settings | None = None) -> Flask:
     """
     app = Flask(__name__)
     app.config.from_mapping((settings or Settings.from_file()).as_flask_config())
+
+    # Initialize extended console logging matching Wings format
+    setup_logging(bool(app.config.get("DEBUG", False)))
+
     app.config["MAX_CONTENT_LENGTH"] = int(app.config["UPLOAD_LIMIT"]) * 1024 * 1024
     app.extensions["server_store"] = ServerStore(app.config["DATA_DIRECTORY"])
     remote_client = PanelRemoteClient(
@@ -57,7 +68,11 @@ def create_app(settings: Settings | None = None) -> Flask:
         sftp_server.start()
         app.extensions["sftp_server"] = sftp_server
     except Exception as err:
-        app.logger.warning("Could not start SFTP server: %s", err)
+        logger.warning("Could not start SFTP server: %s", err)
+
+    @app.before_request
+    def record_request_start():
+        request._wings_start_time = time.monotonic()
 
     @app.after_request
     def add_cors_headers(response):
@@ -78,6 +93,19 @@ def create_app(settings: Settings | None = None) -> Flask:
         )
         response.headers["Access-Control-Max-Age"] = "7200"
         response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+
+        # Log incoming HTTP requests
+        start_time = getattr(request, "_wings_start_time", None)
+        latency = (time.monotonic() - start_time) * 1000 if start_time else 0.0
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        http_logger.info(
+            "%s %s -> %s (%.2fms) [ip:%s]",
+            request.method,
+            request.path,
+            response.status_code,
+            latency,
+            client_ip,
+        )
         return response
 
     @app.errorhandler(404)

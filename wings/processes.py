@@ -152,6 +152,7 @@ class ProcessManager:
 
         invocation = self._startup(configuration, environment)
         environment["STARTUP"] = invocation
+        logger.info("Server %s booting with command: %s", server_uuid, invocation)
         command = ["/bin/sh", "-c", f"exec {invocation}"]
         volumes = self._volumes(server_uuid, configuration)
         publishes = []

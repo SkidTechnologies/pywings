@@ -970,9 +970,11 @@ def register_websocket(sock) -> None:
     @sock.route("/api/servers/<server_uuid>/ws")
     def server_websocket(ws, server_uuid: str):
         if _server_store().get(server_uuid) is None:
+            logger.warning("WebSocket rejected connection for non-existent server: %s", server_uuid)
             ws.close()
             return
 
+        logger.info("WebSocket client connected for server %s", server_uuid)
         authenticated = False
         claims: dict = {}
         active = True
@@ -1062,12 +1064,16 @@ def register_websocket(sock) -> None:
                     elif event == "set state":
                         args = payload.get("args") or []
                         action = str(args[0]) if args else ""
+                        logger.info("WebSocket power action '%s' requested for server %s", action, server_uuid)
                         perms = claims.get("permissions", [])
                         if action == "start" and "control.start" not in perms and "*" not in perms:
+                            logger.warning("WebSocket user lacks 'control.start' permission for server %s", server_uuid)
                             continue
                         if action in {"stop", "kill"} and "control.stop" not in perms and "*" not in perms:
+                            logger.warning("WebSocket user lacks 'control.stop' permission for server %s", server_uuid)
                             continue
                         if action == "restart" and "control.restart" not in perms and "*" not in perms:
+                            logger.warning("WebSocket user lacks 'control.restart' permission for server %s", server_uuid)
                             continue
 
                         def handle_ws_power(act: str):
@@ -1127,10 +1133,13 @@ def register_websocket(sock) -> None:
                     if "websocket.connect" not in permissions and "*" not in permissions:
                         raise ValueError("jwt: missing connect permission")
                 except Exception as error:
+                    logger.warning("WebSocket authentication failed for server %s: %s", server_uuid, error)
                     safe_send("jwt error", [str(error)])
                     continue
 
                 authenticated = True
+                user_id = claims.get("user_uuid", "authenticated")
+                logger.info("WebSocket user %s successfully authenticated for server %s", user_id, server_uuid)
                 safe_send("auth success")
                 current = _server_store().get(server_uuid)
                 safe_send("status", [current.state if current else "offline"])
@@ -1138,6 +1147,7 @@ def register_websocket(sock) -> None:
         finally:
             active = False
             bus.unsubscribe(server_uuid, event_queue)
+            logger.info("WebSocket disconnected for server %s", server_uuid)
             try:
                 ws.close()
             except Exception:
