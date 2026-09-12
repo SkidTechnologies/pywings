@@ -276,6 +276,16 @@ class ProcessManager:
                     or "ghcr.io/pterodactyl/installers:alpine"
                 )
 
+            # Ensure configuration has all egg environment variables
+            if self.remote_client and (not configuration.get("environment") or len(configuration.get("environment", {})) <= 2):
+                try:
+                    fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                    if isinstance(fresh_conf, dict):
+                        configuration.update(fresh_conf)
+                        self.store.update_configuration(server_uuid, configuration)
+                except Exception as err:
+                    logger.warning("Could not refresh server configuration for %s: %s", server_uuid, err)
+
             pref_shell = entrypoint.strip() if entrypoint else "bash"
             shell_name = Path(pref_shell).name or "bash"
 
@@ -335,16 +345,24 @@ class ProcessManager:
                     entrypoint=run_entrypoint,
                 )
 
+                # Close stdin immediately so the installer never hangs waiting for input
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except Exception:
+                        pass
+
                 install_log = self._install_log_path(server_uuid)
                 with install_log.open("a", encoding="utf-8", errors="replace") as log_f:
                     if process.stdout is not None:
-                        for line in process.stdout:
+                        for line in iter(process.stdout.readline, ""):
                             log_f.write(line)
                             log_f.flush()
                             clean = line.rstrip("\r\n")
-                            logger.info("[installer:%s] %s", server_uuid[:8], clean)
-                            bus.publish(server_uuid, InstallOutputEvent, clean)
-                            bus.publish(server_uuid, ConsoleOutputEvent, clean)
+                            if clean:
+                                logger.info("[installer:%s] %s", server_uuid[:8], clean)
+                                bus.publish(server_uuid, InstallOutputEvent, clean)
+                                bus.publish(server_uuid, ConsoleOutputEvent, clean)
 
                 exit_code = process.wait()
                 successful = exit_code == 0

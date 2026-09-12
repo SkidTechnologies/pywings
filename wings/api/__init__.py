@@ -354,12 +354,23 @@ def servers():
         }), 422
 
     server_uuid = str(payload["uuid"])
-    configuration = payload.get("configuration")
-    if not isinstance(configuration, dict):
-        configuration = dict(payload)
-    configuration["uuid"] = server_uuid
-
     start_on_completion = bool(payload.get("start_on_completion", False))
+
+    # Fetch full server configuration from Panel if not provided in payload, matching Go Wings installer.New()
+    configuration = payload.get("configuration")
+    if not isinstance(configuration, dict) or not configuration.get("container"):
+        if current_app.config["PANEL_LOCATION"]:
+            try:
+                configuration = current_app.extensions["remote_client"].get_server_configuration(server_uuid)
+            except Exception as err:
+                logger.warning("Could not fetch full server configuration from Panel for %s: %s", server_uuid, err)
+                if not isinstance(configuration, dict):
+                    configuration = dict(payload)
+        else:
+            if not isinstance(configuration, dict):
+                configuration = dict(payload)
+
+    configuration["uuid"] = server_uuid
     _server_store().add(ServerRecord(uuid=server_uuid, configuration=configuration, state="installing"))
 
     # Begin installation process in the background, exactly matching Wings
