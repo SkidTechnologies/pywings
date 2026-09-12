@@ -138,7 +138,7 @@ class OciImageManager:
         if not hosts.exists():
             hosts.write_text("127.0.0.1 localhost\n::1 localhost\n", encoding="utf-8")
 
-        # passwd and group
+        # passwd and group: ensure both root (0) and container (1000) exist for any egg (Python/Node/Java/etc.)
         passwd = etc / "passwd"
         if not passwd.exists() or passwd.stat().st_size == 0:
             passwd.write_text(
@@ -146,15 +146,45 @@ class OciImageManager:
                 "container:x:1000:1000:container:/home/container:/bin/sh\n",
                 encoding="utf-8",
             )
+        else:
+            try:
+                content = passwd.read_text(encoding="utf-8", errors="replace")
+                if "container:" not in content and ":1000:" not in content:
+                    with passwd.open("a", encoding="utf-8") as f:
+                        f.write("container:x:1000:1000:container:/home/container:/bin/sh\n")
+            except OSError:
+                pass
 
         group = etc / "group"
         if not group.exists() or group.stat().st_size == 0:
             group.write_text("root:x:0:\ncontainer:x:1000:\n", encoding="utf-8")
+        else:
+            try:
+                g_content = group.read_text(encoding="utf-8", errors="replace")
+                if "container:" not in g_content and ":1000:" not in g_content:
+                    with group.open("a", encoding="utf-8") as f:
+                        f.write("container:x:1000:\n")
+            except OSError:
+                pass
+
+        # CA SSL Certificates: ensure pip, npm, curl, git can make secure HTTPS requests in any image
+        ssl_dir = etc / "ssl" / "certs"
+        ssl_dir.mkdir(parents=True, exist_ok=True)
+        for ca_cand in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"):
+            host_ca = Path(ca_cand)
+            if host_ca.is_file():
+                dest_ca = ssl_dir / "ca-certificates.crt"
+                if not dest_ca.exists() or dest_ca.stat().st_size == 0:
+                    try:
+                        shutil.copy2(host_ca, dest_ca)
+                    except OSError:
+                        pass
+                break
 
         # Standard container directories
-        for d in ("home/container", "mnt/server", "mnt/install", "tmp", "dev", "proc", "sys"):
+        for d in ("home/container", "mnt/server", "mnt/install", "tmp", "dev", "proc", "sys", "run"):
             (rootfs / d).mkdir(parents=True, exist_ok=True)
             try:
-                (rootfs / d).chmod(0o777 if d == "tmp" else 0o755)
+                (rootfs / d).chmod(0o1777 if d == "tmp" else 0o755)
             except OSError:
                 pass

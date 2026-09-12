@@ -293,11 +293,14 @@ class ProotRuntime(ContainerRuntime):
             "HOME": "/home/container",
             "USER": "container",
             "LOGNAME": "container",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "PROOT_NO_SECCOMP": "1",    # Prevents ptrace seccomp collision in nested containers
             "PROOT_NO_SUBRECONF": "1",
             "GLIBC_TUNABLES": "glibc.pthread.rseq=0",  # Prevents glibc 2.35+ (Ubuntu 22/Debian 12) SIGSEGV under PRoot
             "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
 
         # Apply image config environment variables
@@ -310,14 +313,22 @@ class ProotRuntime(ContainerRuntime):
         if environment:
             proc_env.update(environment)
 
-        # Guarantee standard system PATH directories are always included in PATH
-        env_path = proc_env.get("PATH", "")
-        standard_dirs = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
-        existing_dirs = [p for p in env_path.split(":") if p]
-        for s_dir in standard_dirs:
-            if s_dir not in existing_dirs:
-                existing_dirs.append(s_dir)
-        proc_env["PATH"] = ":".join(existing_dirs)
+        # Merge and guarantee all PATH directories from server, image, and standard Linux dirs
+        path_components: list[str] = []
+        for src_path in (
+            (environment or {}).get("PATH", ""),
+            next((item.split("=", 1)[1] for item in img_env if item.startswith("PATH=")), ""),
+            proc_env.get("PATH", ""),
+        ):
+            if src_path:
+                for piece in src_path.split(":"):
+                    if piece and piece not in path_components:
+                        path_components.append(piece)
+
+        for s_dir in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            if s_dir not in path_components:
+                path_components.append(s_dir)
+        proc_env["PATH"] = ":".join(path_components)
 
         is_installer = "_installer" in container
         logger.info(

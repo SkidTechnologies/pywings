@@ -491,6 +491,9 @@ class ProcessManager:
         else:
             primary_port = str(configuration.get("server_port", "25565"))
         environment.setdefault("SERVER_PORT", primary_port)
+        limits = ProcessManager._limits(configuration)
+        environment.setdefault("SERVER_MEMORY", str(limits.get("memory", 1024)))
+        environment.setdefault("SERVER_IP", "0.0.0.0")
         return environment
 
     @staticmethod
