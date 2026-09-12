@@ -1,0 +1,18 @@
+debug: false
+uuid: 00000000-0000-0000-0000-000000000000
+token_id: example_token_id
+token: example_token_secret
+api:
+  host: 0.0.0.0
+  port: 8080
+  ssl:
+    enabled: false
+    cert: /etc/letsencrypt/live/node.example.com/fullchain.pem
+    key: /etc/letsencrypt/live/node.example.com/privkey.pem
+  upload_limit: 100
+system:
+  data: ./data
+sftp:
+  bind_port: 2022
+  allowed_mounts: []
+remote: https://panel.example.com
