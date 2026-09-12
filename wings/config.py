@@ -31,6 +31,16 @@ def _env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _get_version() -> str:
+    v_file = PROJECT_ROOT / "version.txt"
+    if v_file.is_file():
+        try:
+            return v_file.read_text(encoding="utf-8").strip() or "1.0.0"
+        except Exception:
+            pass
+    return "1.0.0"
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings extracted from the local Wings configuration."""
@@ -50,7 +60,7 @@ class Settings:
     sftp_bind_address: str = "0.0.0.0"
     allowed_mounts: tuple[str, ...] = ()
     remote: str = ""
-    version: str = "0.1.0"
+    version: str = "1.0.0"
     config_path: Path = DEFAULT_CONFIG_PATH
     proot_path: str = ""
 
@@ -101,7 +111,7 @@ class Settings:
             sftp_bind_address=clean_sftp_address,
             allowed_mounts=tuple(str(item) for item in (sftp.get("allowed_mounts") or [])),
             remote=str(_env("WINGS_REMOTE", values.get("remote", ""))),
-            version=str(_env("WINGS_VERSION", "0.1.0")),
+            version=str(_env("WINGS_VERSION", _get_version())),
             config_path=path,
             proot_path=proot_path_val,
         )
