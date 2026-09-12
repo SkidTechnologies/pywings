@@ -185,7 +185,6 @@ class TestProotRuntime(unittest.TestCase):
         )
 
         self.assertIn("/fake/proot", cmd[0])
-        self.assertIn("-n", cmd)
         self.assertIn("-0", cmd)
         self.assertIn("-r", cmd)
         rootfs_idx = cmd.index("-r") + 1

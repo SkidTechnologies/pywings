@@ -168,35 +168,42 @@ class ProotRuntime(ContainerRuntime):
             except OSError:
                 pass
 
-        cmd = [
-            str(proot_bin),
-            "-n",   # Pure ptrace mode: disables seccomp acceleration, avoiding PTRACE_O_TRACESECCOMP collision
+        # Ensure DNS resolution files inside rootfs exist by copying host configs
+        etc_dir = rf_path / "etc"
+        for conf_file in ("resolv.conf", "hosts"):
+            host_conf = Path(f"/etc/{conf_file}")
+            guest_conf = etc_dir / conf_file
+            if host_conf.is_file():
+                try:
+                    if guest_conf.is_symlink() or not guest_conf.exists():
+                        guest_conf.unlink(missing_ok=True)
+                        guest_conf.write_bytes(host_conf.read_bytes())
+                except OSError:
+                    pass
+
+        cmd = [str(proot_bin)]
+        if ProotDetector.supports_no_seccomp():
+            cmd.append("-n")
+
+        cmd.extend([
             "-0",   # Root emulation (UID 0 / GID 0 inside jail)
             "-r", str(rf_path),
             "-w", cont_cwd,
-        ]
+        ])
 
         # Bind system pseudo-filesystems safely if present
         for sys_mount in ("/dev", "/proc", "/sys"):
             if os.path.exists(sys_mount):
                 cmd.extend(["-b", sys_mount])
 
-        # Bind network configuration if present on host
-        if os.path.exists("/etc/resolv.conf"):
-            try:
-                (rf_path / "etc" / "resolv.conf").touch(exist_ok=True)
-                cmd.extend(["-b", "/etc/resolv.conf:/etc/resolv.conf"])
-            except OSError:
-                pass
-        if os.path.exists("/etc/hosts"):
-            try:
-                (rf_path / "etc" / "hosts").touch(exist_ok=True)
-                cmd.extend(["-b", "/etc/hosts:/etc/hosts"])
-            except OSError:
-                pass
-
         for vol in volumes:
             if ":" in vol:
+                parts = vol.split(":")
+                cont_target = parts[1].lstrip("/\\")
+                try:
+                    (rf_path / cont_target).mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
                 cmd.extend(["-b", vol])
 
         exec_args = list(command) if command else ["/bin/sh", "-c", "while true; do sleep 3600; done"]

@@ -16,6 +16,11 @@ class ProotDetector:
     """Discovers and validates the PRoot binary on the host."""
 
     _cached_path: Path | None = None
+    _supports_no_seccomp: bool = False
+
+    @classmethod
+    def supports_no_seccomp(cls) -> bool:
+        return cls._supports_no_seccomp
 
     @classmethod
     def find_proot(cls, configured_path: str | None = None) -> Path:
@@ -57,7 +62,19 @@ class ProotDetector:
                         if line_s and not line_s.startswith("|") and not line_s.startswith("_"):
                             ver_line = line_s
                             break
-                    logger.info("Found PRoot binary at %s (%s)", path, ver_line)
+
+                    # Check whether this PRoot binary supports the -n flag
+                    help_res = subprocess.run(
+                        [str(path), "--help"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    help_out = (help_res.stdout or help_res.stderr or "").lower()
+                    cls._supports_no_seccomp = "-n" in help_out or "--no-seccomp" in help_out
+
+                    logger.info("Found PRoot binary at %s (%s, supports_no_seccomp=%s)", path, ver_line, cls._supports_no_seccomp)
                     cls._cached_path = path
                     return path
                 except Exception as err:
