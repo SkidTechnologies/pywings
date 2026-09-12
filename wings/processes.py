@@ -290,6 +290,9 @@ class ProcessManager:
                 except Exception as err:
                     logger.warning("Could not refresh server configuration for %s: %s", server_uuid, err)
 
+            environment = self._environment(configuration)
+            self._apply_java_environment(container_image, environment)
+
             # Create /mnt/server and /mnt/install symlinks on host if possible
             try:
                 Path("/mnt").mkdir(parents=True, exist_ok=True)
