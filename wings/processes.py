@@ -138,6 +138,17 @@ class ProcessManager:
                 logger.info("Server %s is currently stopping; waiting before restart", server_uuid)
                 self._wait_for_offline(server_uuid, timeout=15)
 
+            # Always fetch the latest configuration from Panel before boot so image, variables, and startup command changes apply immediately!
+            if self.remote_client:
+                try:
+                    fresh_conf = self.remote_client.get_server_configuration(server_uuid)
+                    if isinstance(fresh_conf, dict) and fresh_conf:
+                        configuration = fresh_conf
+                        self.store.update_configuration(server_uuid, configuration)
+                        logger.info("Refreshed server configuration for %s from Panel before boot", server_uuid)
+                except Exception as err:
+                    logger.warning("Could not refresh server configuration from Panel for %s: %s", server_uuid, err)
+
             self._start_locked(server_uuid, configuration)
 
     def _start_locked(self, server_uuid: str, configuration: dict) -> None:

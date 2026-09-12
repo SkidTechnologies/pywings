@@ -78,9 +78,18 @@ class ProotRuntime(ContainerRuntime):
             raise RuntimeCommandError(f"Failed pulling OCI image {image}: {err}") from err
 
     def create(self, name: str, image: str) -> CommandResult:
-        """Create a container instance linked to the image rootfs."""
+        """Create or update a container instance linked to the image rootfs."""
         container_path = self.containers_dir / name
         container_path.mkdir(parents=True, exist_ok=True)
+
+        meta_file = container_path / "meta.json"
+        old_image = None
+        if meta_file.exists():
+            try:
+                old_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                old_image = old_meta.get("image")
+            except Exception:
+                pass
 
         # Pull or get cached image
         instance = self._cached_images.get(image)
@@ -101,8 +110,11 @@ class ProotRuntime(ContainerRuntime):
                 "user": instance.config.user,
             },
         }
-        (container_path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        logger.info("Created container %s with rootfs %s", name, instance.rootfs)
+        meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        if old_image and old_image != image:
+            logger.info("Updated container %s image: %s -> %s (rootfs=%s)", name, old_image, image, instance.rootfs)
+        else:
+            logger.info("Created container %s with rootfs %s", name, instance.rootfs)
         return CommandResult(command=("proot-oci", "create", name), returncode=0, stdout=f"{name}\n", stderr="")
 
     def inspect(self, container_or_image: str) -> CommandResult:

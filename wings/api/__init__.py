@@ -733,13 +733,13 @@ def server_power(server_uuid: str):
             srv = _server_store().get(server_uuid)
             if not srv:
                 return
-            if action in {"start", "restart"} and not ((srv.configuration.get("container") or {}).get("image") or srv.configuration.get("image")):
-                if app.config["PANEL_LOCATION"]:
-                    try:
-                        cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
+            if action in {"start", "restart"} and app.config["PANEL_LOCATION"]:
+                try:
+                    cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
+                    if isinstance(cfg, dict) and cfg:
                         srv = _server_store().update_configuration(server_uuid, cfg)
-                    except Exception:
-                        pass
+                except Exception as err:
+                    logger.warning("Could not refresh server config on power %s for %s: %s", action, server_uuid, err)
             try:
                 if action == "start":
                     manager.start(server_uuid, srv.configuration)
@@ -983,6 +983,15 @@ def sync_server(server_uuid: str):
     try:
         configuration = current_app.extensions["remote_client"].get_server_configuration(server_uuid)
         _server_store().update_configuration(server_uuid, configuration)
+        # Pre-pull new image and update container metadata immediately if server is not running
+        manager = current_app.extensions["process_manager"]
+        image = (configuration.get("container") or {}).get("image") or configuration.get("image")
+        if image and not manager.is_running(server_uuid):
+            try:
+                manager.runtime.pull(image)
+                manager.runtime.create(server_uuid, image)
+            except Exception as err:
+                logger.warning("Could not pre-sync runtime container for %s: %s", server_uuid, err)
     except PanelRemoteError as error:
         # Keep a local placeholder if the Panel is temporarily unavailable;
         # Wings can retry sync later without losing server identity.
@@ -1117,13 +1126,13 @@ def register_websocket(sock) -> None:
                                     return
                                 manager = app.extensions["process_manager"]
                                 try:
-                                    if act in {"start", "restart"} and not ((srv.configuration.get("container") or {}).get("image") or srv.configuration.get("image")):
-                                        if app.config["PANEL_LOCATION"]:
-                                            try:
-                                                cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
+                                    if act in {"start", "restart"} and app.config["PANEL_LOCATION"]:
+                                        try:
+                                            cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
+                                            if isinstance(cfg, dict) and cfg:
                                                 srv = _server_store().update_configuration(server_uuid, cfg)
-                                            except Exception as sync_err:
-                                                logger.warning("Could not sync server configuration from Panel (%s), using local config", sync_err)
+                                        except Exception as sync_err:
+                                            logger.warning("Could not sync server configuration from Panel (%s), using local config", sync_err)
                                     if act == "start":
                                         manager.start(server_uuid, srv.configuration)
                                     elif act == "stop":
