@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import hashlib
 import mimetypes
+import os
 from pathlib import Path
 import shutil
 import tarfile
@@ -283,31 +284,100 @@ class ServerFilesystem:
         archive.unlink()
 
     def backup_path(self, backup_id: str) -> Path:
-        if Path(backup_id).name != backup_id:
-            raise FilesystemError("Invalid backup identifier.")
-        archive = self.root / "backups" / f"{backup_id}.tar.gz"
-        if not archive.is_file():
-            raise FilesystemError("The requested backup was not found.")
-        return archive
+        cand_paths = [
+            self.root / "backups" / f"{backup_id}.tar.gz",
+            self.root / f"{backup_id}.tar.gz",
+            self.root.parent / "backups" / f"{backup_id}.tar.gz",
+            Path("./data/backups") / f"{backup_id}.tar.gz",
+        ]
+        for p in cand_paths:
+            if p.is_file():
+                return p
+        matches = list(self.root.parent.glob(f"**/{backup_id}.tar.gz"))
+        if matches:
+            return matches[0]
+        raise FilesystemError("The requested backup was not found on this system.")
 
-    def restore_backup(self, backup_id: str, truncate_directory: bool = False) -> None:
-        archive = self.backup_path(backup_id)
+    def restore_backup(self, backup_id: str, truncate_directory: bool = False, archive_path: Path | None = None) -> None:
+        archive = archive_path or self.backup_path(backup_id)
+
         if truncate_directory:
             for entry in self.root.iterdir():
-                if entry.name != "backups" and entry.name != ".install":
-                    if entry.is_dir() and not entry.is_symlink():
-                        shutil.rmtree(entry, ignore_errors=True)
-                    else:
-                        entry.unlink(missing_ok=True)
+                if entry.name not in ("backups", ".install", ".tmp", ".shm"):
+                    try:
+                        if entry.is_dir() and not entry.is_symlink():
+                            shutil.rmtree(entry, ignore_errors=True)
+                        else:
+                            entry.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
-        with tarfile.open(archive, "r:gz") as source:
-            members = source.getmembers()
-            for member in members:
-                if member.issym() or member.islnk():
-                    raise FilesystemError("The backup contains unsupported symbolic or hard links.")
-                target = (self.root / member.name).resolve()
-                if target == self.root / "backups" or self.root / "backups" in target.parents:
-                    raise FilesystemError("The backup cannot restore files into the backups directory.")
-                if target != self.root and self.root not in target.parents:
-                    raise FilesystemError("The backup contains a path outside the server root.")
-            source.extractall(self.root, members=members)
+        with tarfile.open(archive, mode="r:*") as source:
+            root_abs = os.path.abspath(self.root)
+            for member in source.getmembers():
+                norm_name = member.name.lstrip("/\\")
+                if not norm_name or norm_name == ".":
+                    continue
+                target = self.root / norm_name
+                try:
+                    target_abs = os.path.abspath(target)
+                    if not (target_abs == root_abs or target_abs.startswith(root_abs + os.sep)):
+                        continue
+                except Exception:
+                    continue
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+
+                if member.isdir():
+                    if not os.path.islink(target):
+                        target.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                if member.issym():
+                    if os.path.islink(target) or target.exists():
+                        target.unlink(missing_ok=True)
+                    link_target = member.linkname
+                    if link_target.startswith("/"):
+                        target_in_root = self.root / link_target.lstrip("/\\")
+                        try:
+                            rel_target = os.path.relpath(target_in_root, target.parent)
+                            link_target = rel_target.replace("\\", "/")
+                        except ValueError:
+                            pass
+                    try:
+                        os.symlink(link_target, target)
+                    except OSError:
+                        pass
+                    continue
+
+                if member.islnk():
+                    src_norm = member.linkname.lstrip("/\\")
+                    src_path = self.root / src_norm
+                    if os.path.islink(target) or target.exists():
+                        target.unlink(missing_ok=True)
+                    try:
+                        os.link(src_path, target)
+                    except OSError:
+                        if src_path.is_file():
+                            try:
+                                shutil.copy2(src_path, target)
+                            except OSError:
+                                pass
+                    continue
+
+                if member.isreg():
+                    if os.path.islink(target) or target.exists():
+                        if os.path.isdir(target) and not os.path.islink(target):
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink(missing_ok=True)
+                    try:
+                        with source.extractfile(member) as src_f, open(target, "wb") as dst_f:
+                            if src_f:
+                                shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
+                        try:
+                            target.chmod(member.mode)
+                        except OSError:
+                            pass
+                    except Exception:
+                        pass

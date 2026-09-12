@@ -228,6 +228,26 @@ class PanelRemoteClient:
         """Notify the Panel of backup restoration status."""
         self._request("POST", f"/backups/{backup_uuid}/restore", data={"successful": bool(successful)})
 
+    def get_servers(self) -> list[dict]:
+        """Fetch all servers assigned to this node from the Panel."""
+        try:
+            payload = self._request("GET", "/servers", query={"page": 1, "per_page": 100})
+            if isinstance(payload, dict):
+                data = payload.get("data", [])
+                meta = payload.get("meta", {})
+                last_page = int(meta.get("last_page", 1))
+                all_servers = list(data)
+                for page in range(2, last_page + 1):
+                    p_data = self._request("GET", "/servers", query={"page": page, "per_page": 100})
+                    if isinstance(p_data, dict):
+                        all_servers.extend(p_data.get("data", []))
+                return all_servers
+            elif isinstance(payload, list):
+                return payload
+        except Exception as err:
+            logger.warning("Could not fetch node servers from Panel: %s", err)
+        return []
+
     def set_transfer_status(self, server_uuid: str, successful: bool) -> None:
         """Notify the Panel of transfer status."""
         state = "success" if successful else "failure"

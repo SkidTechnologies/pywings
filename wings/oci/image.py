@@ -230,3 +230,35 @@ class OciImageManager:
                 (rootfs / d).chmod(0o1777 if d == "tmp" else 0o755)
             except OSError:
                 pass
+
+    def prune_unused_images(self, active_images: set[str]) -> None:
+        """Remove cached rootfs directories for images not used by any server."""
+        active_refs = set()
+        active_digests = set()
+        for img_str in active_images:
+            try:
+                ref = OciReference.parse(img_str)
+                ref_key = ref.normalized_name.replace("/", "_").replace(":", "_").replace("@", "_")
+                active_refs.add(ref_key)
+                ref_cache_file = self.cache.base_dir / "refs" / f"{ref_key}.json"
+                if ref_cache_file.is_file():
+                    data = json.loads(ref_cache_file.read_text(encoding="utf-8"))
+                    if data.get("config_digest"):
+                        clean_d = self.cache._clean_digest(data["config_digest"])
+                        active_digests.add(clean_d)
+            except Exception:
+                continue
+
+        # Prune unused rootfs directories
+        if self.cache.rootfs_dir.is_dir():
+            for rf in self.cache.rootfs_dir.iterdir():
+                if rf.is_dir() and rf.name not in active_digests:
+                    logger.info("Pruning unused egg rootfs: %s", rf.name[:16])
+                    shutil.rmtree(rf, ignore_errors=True)
+
+        # Prune unused ref files
+        refs_dir = self.cache.base_dir / "refs"
+        if refs_dir.is_dir():
+            for ref_file in refs_dir.glob("*.json"):
+                if ref_file.stem not in active_refs:
+                    ref_file.unlink(missing_ok=True)

@@ -1049,26 +1049,36 @@ class ProcessManager:
         self.stop(server_uuid, configuration, wait_seconds)
         self.start(server_uuid, configuration)
 
-    def remove(self, server_uuid: str) -> None:
-        """Stop the managed process and remove its udocker container."""
-        lock = self._get_server_lock(server_uuid)
-        with lock:
-            with self._lock:
-                process = self._processes.get(server_uuid)
-            if process is not None and process.poll() is None:
-                process.kill()
+    def remove(self, server_uuid: str, purge_files: bool = True) -> None:
+        """Stop/kill server processes, remove container, and completely delete server files."""
+        self.kill(server_uuid)
+        try:
+            self.runtime.remove(server_uuid)
+        except Exception:
+            pass
+
+        with self._lock:
+            self._processes.pop(server_uuid, None)
+            self._started_at.pop(server_uuid, None)
+            self._server_locks.pop(server_uuid, None)
+            self._last_crash.pop(server_uuid, None)
+            self._cpu_history.pop(server_uuid, None)
+            self._cpu_cache.pop(server_uuid, None)
+            self._disk_cache.pop(server_uuid, None)
+            self._net_baseline.pop(server_uuid, None)
+            self._last_net.pop(server_uuid, None)
+
+        if purge_files:
+            server_root = self.store.data_directory / server_uuid
+            if server_root.is_dir():
                 try:
-                    process.wait(timeout=10)
-                except Exception:
-                    pass
-            with self._lock:
-                self._processes.pop(server_uuid, None)
-                self._started_at.pop(server_uuid, None)
-            try:
-                self.runtime.remove(server_uuid)
-            except (RuntimeUnavailableError, RuntimeCommandError):
-                pass
-            self.set_server_state(server_uuid, STATE_OFFLINE)
+                    shutil.rmtree(server_root, ignore_errors=True)
+                    logger.info("Purged server files for %s at %s", server_uuid, server_root)
+                except Exception as err:
+                    logger.warning("Could not delete server directory for %s: %s", server_uuid, err)
+
+        self.store.remove(server_uuid)
+        self.set_server_state(server_uuid, STATE_OFFLINE)
 
     @staticmethod
     def _read_network_bytes() -> tuple[int, int]:

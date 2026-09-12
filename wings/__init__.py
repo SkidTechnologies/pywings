@@ -62,10 +62,63 @@ def create_app(settings: Settings | None = None) -> Flask:
     )
     sock = Sock(app)
 
-    # Reset any server states left as 'installing' or 'restoring' on the Panel on daemon boot
+    # Reset server states and clean up deleted servers & unused egg images on boot
+    def _startup_sync_and_cleanup():
+        if not app.config["PANEL_LOCATION"]:
+            return
+        remote_client.reset_servers_state()
+        time.sleep(3)
+        try:
+            panel_servers = remote_client.get_servers()
+            if not panel_servers:
+                return
+            panel_uuids = set()
+            for item in panel_servers:
+                u = item.get("uuid") or (item.get("settings") or {}).get("uuid") or (item.get("attributes") or {}).get("uuid")
+                if u:
+                    panel_uuids.add(str(u).lower())
+
+            if not panel_uuids:
+                return
+
+            pm = app.extensions.get("process_manager")
+            store = app.extensions.get("server_store")
+            if not pm or not store:
+                return
+
+            # Clean up local directories on disk for servers deleted in Panel
+            data_dir = Path(app.config["DATA_DIRECTORY"]).resolve()
+            if data_dir.is_dir():
+                for entry in data_dir.iterdir():
+                    if entry.is_dir() and len(entry.name) == 36 and entry.name.count("-") == 4:
+                        if entry.name.lower() not in panel_uuids:
+                            logger.info("Cleaning up unlisted server directory on disk: %s", entry.name)
+                            pm.remove(entry.name, purge_files=True)
+
+            # Clean up server records in store for deleted servers
+            for srv in store.all():
+                if srv.uuid.lower() not in panel_uuids:
+                    logger.info("Cleaning up unlisted server from local store: %s", srv.uuid)
+                    pm.remove(srv.uuid, purge_files=True)
+
+            # Clean up unreferenced/unused OCI egg images and rootfs directories
+            try:
+                active_images = set()
+                for srv in store.all():
+                    cfg = srv.configuration or {}
+                    img = (cfg.get("container") or {}).get("image") or cfg.get("image")
+                    if img:
+                        active_images.add(str(img).strip())
+                pm.runtime.oci_manager.prune_unused_images(active_images)
+            except Exception as prune_err:
+                logger.debug("Image rootfs prune encountered error: %s", prune_err)
+
+        except Exception as err:
+            logger.warning("Startup sync & cleanup failed: %s", err)
+
     if app.config["PANEL_LOCATION"]:
         import threading
-        threading.Thread(target=remote_client.reset_servers_state, daemon=True).start()
+        threading.Thread(target=_startup_sync_and_cleanup, daemon=True).start()
 
     # Start integrated SFTP server matching Wings port configuration
     try:

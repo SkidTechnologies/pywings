@@ -602,27 +602,59 @@ def restore_backup(server_uuid: str, backup_uuid: str):
         return error
     payload = request.get_json(silent=True) or {}
     truncate_directory = bool(payload.get("truncate_directory", False))
+    download_url = payload.get("download_url")
     manager = current_app.extensions["process_manager"]
     app = current_app._get_current_object()
 
     def _async_restore():
         with app.app_context():
+            # 1. Transition state to restoring
+            manager.set_server_state(server_uuid, "restoring")
+            bus.publish(server_uuid, DaemonMessageEvent, f"[Wings Daemon]: Starting restoration from backup {backup_uuid}...")
+
+            temp_download = None
+            successful = False
             try:
+                # 2. Stop server if running
                 manager.stop(server_uuid, server.configuration)
-                _filesystem(server_uuid).restore_backup(backup_uuid, truncate_directory=truncate_directory)
-                bus.publish(server_uuid, "backup restore completed")
-                if app.config["PANEL_LOCATION"]:
-                    remote = app.extensions["remote_client"]
-                    remote.send_restoration_status(backup_uuid, True)
+
+                # 3. If S3 / remote backup with download_url, download archive first
+                archive_file = None
+                if download_url:
+                    logger.info("Downloading remote backup for %s from %s...", server_uuid, download_url)
+                    temp_download = Path(app.config["DATA_DIRECTORY"]) / server_uuid / "backups" / f"restore-{backup_uuid}.tar.gz"
+                    temp_download.parent.mkdir(parents=True, exist_ok=True)
+                    req = urllib.request.Request(download_url, headers={"User-Agent": "Pterodactyl-Wings"})
+                    with urllib.request.urlopen(req, timeout=180) as resp, open(temp_download, "wb") as out_f:
+                        shutil.copyfileobj(resp, out_f, length=1024 * 1024)
+                    archive_file = temp_download
+
+                # 4. Perform extraction
+                _filesystem(server_uuid).restore_backup(backup_uuid, truncate_directory=truncate_directory, archive_path=archive_file)
+                successful = True
                 logger.info("Backup %s for %s restored successfully", backup_uuid, server_uuid)
             except Exception as exc:
-                logger.error("Failed restoring backup %s for %s: %s", backup_uuid, server_uuid, exc)
-                if app.config["PANEL_LOCATION"]:
-                    try:
-                        remote = app.extensions["remote_client"]
-                        remote.send_restoration_status(backup_uuid, False)
-                    except Exception:
-                        pass
+                logger.error("Failed restoring backup %s for %s: %s", backup_uuid, server_uuid, exc, exc_info=True)
+                successful = False
+            finally:
+                if temp_download and temp_download.exists():
+                    temp_download.unlink(missing_ok=True)
+
+            # 5. Notify Panel of restoration completion
+            if app.config["PANEL_LOCATION"]:
+                try:
+                    remote = app.extensions["remote_client"]
+                    remote.send_restoration_status(backup_uuid, successful)
+                    logger.info("Notified Panel of backup restoration status: %s (successful=%s)", backup_uuid, successful)
+                except Exception as err:
+                    logger.warning("Could not send restoration status to Panel for %s: %s", backup_uuid, err)
+
+            # 6. Publish events and set state back to offline
+            manager.set_server_state(server_uuid, STATE_OFFLINE)
+            bus.publish(server_uuid, "backup restore completed", "")
+            msg = "[Wings Daemon]: Completed server restoration from backup." if successful else "[Wings Daemon]: Server restoration failed!"
+            bus.publish(server_uuid, DaemonMessageEvent, msg)
+            bus.publish(server_uuid, ConsoleOutputEvent, f"container@pterodactyl~ {msg}")
 
     Thread(target=_async_restore, daemon=True).start()
     return "", 202
@@ -1098,16 +1130,13 @@ def server_logs(server_uuid: str):
 @api.route("/api/servers/<server_uuid>", methods=["DELETE"], provide_automatic_options=False)
 @require_authorization
 def delete_server(server_uuid: str):
-    """Remove the runtime container and registry entry, preserving data."""
+    """Remove the runtime container, kill processes, and purge server data."""
     if _server_store().get(server_uuid) is None:
         return jsonify({"error": "The requested resource does not exist on this instance."}), 404
     try:
-        current_app.extensions["process_manager"].remove(server_uuid)
-    except RuntimeUnavailableError as error:
-        return jsonify({"error": str(error)}), 503
-    except RuntimeCommandError as error:
-        return jsonify({"error": str(error)}), 400
-    _server_store().remove(server_uuid)
+        current_app.extensions["process_manager"].remove(server_uuid, purge_files=True)
+    except Exception as error:
+        logger.warning("Error deleting server %s: %s", server_uuid, error)
     return "", 204
 
 
