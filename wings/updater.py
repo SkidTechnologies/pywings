@@ -19,16 +19,17 @@ logger = logging.getLogger("wings.updater")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = PROJECT_ROOT / "version.txt"
-DEFAULT_VERSION = "1.0.0"
+DEFAULT_VERSION = "1.0.6-pywings"
 REMOTE_VERSION_URL = "https://raw.githubusercontent.com/SkidTechnologies/pywings/main/version.txt"
 REMOTE_ARCHIVE_URL = "https://github.com/SkidTechnologies/pywings/archive/refs/heads/main.zip"
 
 
 def parse_version(v_str: str) -> tuple[int, ...]:
-    """Convert version string like '1.0.0' or 'v1.0.1' into tuple of integers."""
+    """Convert version string like '1.0.6-pywings' or 'v1.0.5' into tuple of integers."""
     clean = v_str.strip().lstrip("vV")
+    base = clean.split("-")[0].split("+")[0]
     parts = []
-    for piece in clean.split("."):
+    for piece in base.split("."):
         try:
             parts.append(int(piece))
         except ValueError:
