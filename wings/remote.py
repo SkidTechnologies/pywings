@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -43,7 +44,8 @@ class PanelRemoteClient:
         path: str,
         data: dict | list | None = None,
         query: dict | None = None,
-        timeout: int = 15,
+        timeout: int = 30,
+        retries: int = 3,
     ) -> Any:
         if not self.base_url:
             raise PanelRemoteError("Panel remote URL is not configured")
@@ -64,36 +66,57 @@ class PanelRemoteClient:
         if data is not None:
             body = json.dumps(data).encode("utf-8")
 
-        req = Request(url, data=body, headers=headers, method=method)
-        try:
-            with urlopen(req, timeout=timeout) as response:
-                status = response.status
-                raw = response.read().decode("utf-8")
-                if not raw.strip():
-                    return None
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:
-                    return raw
-        except HTTPError as error:
-            error_body = ""
+        for attempt in range(1, retries + 1):
+            req = Request(url, data=body, headers=headers, method=method)
             try:
-                error_body = error.read().decode("utf-8")
-            except Exception:
-                pass
-            logger.warning(
-                "Panel API %s %s returned HTTP %s: %s",
-                method,
-                path,
-                error.code,
-                error_body,
-            )
-            raise PanelRemoteError(
-                f"Panel API {method} {path} returned HTTP {error.code}: {error_body or error.reason}"
-            ) from error
-        except (URLError, TimeoutError, OSError) as error:
-            logger.warning("Panel API %s %s request failed: %s", method, path, error)
-            raise PanelRemoteError(f"Panel API {method} {path} connection failed: {error}") from error
+                with urlopen(req, timeout=timeout) as response:
+                    raw = response.read().decode("utf-8")
+                    if not raw.strip():
+                        return None
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        return raw
+            except HTTPError as error:
+                error_body = ""
+                try:
+                    error_body = error.read().decode("utf-8")
+                except Exception:
+                    pass
+                if error.code in {400, 401, 403, 404, 422}:
+                    logger.warning(
+                        "Panel API %s %s returned HTTP %s: %s",
+                        method,
+                        path,
+                        error.code,
+                        error_body,
+                    )
+                    raise PanelRemoteError(
+                        f"Panel API {method} {path} returned HTTP {error.code}: {error_body or error.reason}"
+                    ) from error
+                if attempt == retries:
+                    raise PanelRemoteError(
+                        f"Panel API {method} {path} returned HTTP {error.code} after {retries} attempts: {error_body or error.reason}"
+                    ) from error
+                time.sleep(1.0 * attempt)
+            except (URLError, TimeoutError, OSError) as error:
+                if attempt == retries:
+                    logger.warning(
+                        "Panel API %s %s request failed after %d attempts: %s",
+                        method,
+                        path,
+                        retries,
+                        error,
+                    )
+                    raise PanelRemoteError(f"Panel API {method} {path} connection failed: {error}") from error
+                logger.debug(
+                    "Panel API %s %s attempt %d failed (%s), retrying...",
+                    method,
+                    path,
+                    attempt,
+                    error,
+                )
+                time.sleep(1.0 * attempt)
 
     def get_server_configuration(self, server_uuid: str) -> dict:
         """Fetch server settings and process configuration from the Panel."""

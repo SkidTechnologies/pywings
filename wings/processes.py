@@ -357,12 +357,11 @@ class ProcessManager:
 
             # CRITICAL: Notify Panel that install completed!
             if self.remote_client:
-                try:
-                    self.remote_client.set_installation_status(
-                        server_uuid, successful=successful, reinstall=reinstall
-                    )
-                except Exception as err:
-                    logger.error("Failed to notify panel of installation status for %s: %s", server_uuid, err)
+                Thread(
+                    target=self._notify_install_with_retries,
+                    args=(server_uuid, successful, reinstall),
+                    daemon=True,
+                ).start()
 
             self.set_server_state(server_uuid, STATE_OFFLINE if successful else "install_failed")
             bus.publish(server_uuid, InstallCompletedEvent)
@@ -375,6 +374,27 @@ class ProcessManager:
             if start_on_completion and successful:
                 logger.info("Starting server %s after successful installation", server_uuid)
                 self.start(server_uuid, configuration)
+
+    def _notify_install_with_retries(self, server_uuid: str, successful: bool, reinstall: bool) -> None:
+        """Retry sending installation status to Panel until acknowledged."""
+        if not self.remote_client:
+            return
+        for attempt in range(1, 10):
+            try:
+                self.remote_client.set_installation_status(
+                    server_uuid, successful=successful, reinstall=reinstall
+                )
+                logger.info("Successfully notified Panel of install status for %s", server_uuid)
+                return
+            except Exception as err:
+                logger.warning(
+                    "Attempt %d to notify Panel of install status for %s failed (%s), retrying in %ds...",
+                    attempt,
+                    server_uuid,
+                    err,
+                    min(30, attempt * 3),
+                )
+                time.sleep(min(30, attempt * 3))
 
     @staticmethod
     def validate_configuration(configuration: dict) -> str:

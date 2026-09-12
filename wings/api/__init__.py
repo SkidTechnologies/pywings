@@ -1080,8 +1080,11 @@ def register_websocket(sock) -> None:
                                 try:
                                     if act in {"start", "restart"} and not ((srv.configuration.get("container") or {}).get("image") or srv.configuration.get("image")):
                                         if app.config["PANEL_LOCATION"]:
-                                            cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
-                                            srv = _server_store().update_configuration(server_uuid, cfg)
+                                            try:
+                                                cfg = app.extensions["remote_client"].get_server_configuration(server_uuid)
+                                                srv = _server_store().update_configuration(server_uuid, cfg)
+                                            except Exception as sync_err:
+                                                logger.warning("Could not sync server configuration from Panel (%s), using local config", sync_err)
                                     if act == "start":
                                         manager.start(server_uuid, srv.configuration)
                                     elif act == "stop":
