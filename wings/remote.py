@@ -276,7 +276,7 @@ class PanelRemoteClient:
             "session_id": session_id,
             "client_version": client_version,
         }
-        resp = self._request("POST", "/sftp", data=payload)
+        resp = self._request("POST", "/sftp/auth", data=payload)
         if not isinstance(resp, dict) or "server" not in resp:
             raise PanelRemoteError("Invalid SFTP authentication response from Panel")
         return resp
