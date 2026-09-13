@@ -401,9 +401,10 @@ class SFTPServer:
             transport.set_subsystem_handler(
                 "sftp",
                 paramiko.SFTPServer,
-                sftp_si=lambda: PteroSFTPInterface(
+                sftp_si=lambda *args, **kwargs: PteroSFTPInterface(
                     self.data_directory / ssh_server.auth_data["server"],
                     ssh_server.auth_data.get("permissions", []),
+                    server=args[0] if args else None,
                     server_uuid=ssh_server.auth_data.get("server"),
                     user_uuid=ssh_server.auth_data.get("user"),
                     client_ip=client_ip,
