@@ -149,6 +149,47 @@ def create_app(settings: Settings | None = None) -> Flask:
     except Exception as err:
         logger.warning("Could not initialize auto-updater: %s", err)
 
+    # Monitor config.yml for live SFTP port/address or settings updates
+    def _config_watcher():
+        cfg_path_str = app.config.get("CONFIG_PATH")
+        if not cfg_path_str:
+            return
+        cfg_path = Path(cfg_path_str)
+        last_mtime = cfg_path.stat().st_mtime if cfg_path.exists() else 0.0
+
+        while True:
+            time.sleep(5)
+            try:
+                if not cfg_path.exists():
+                    continue
+                current_mtime = cfg_path.stat().st_mtime
+                if current_mtime > last_mtime:
+                    last_mtime = current_mtime
+                    logger.info("Detected change in %s; reloading configuration...", cfg_path.name)
+                    new_settings = Settings.from_file(cfg_path)
+                    new_sftp_port = new_settings.sftp_bind_port
+                    new_sftp_addr = new_settings.sftp_bind_address
+
+                    curr_sftp = app.extensions.get("sftp_server")
+                    if curr_sftp and (curr_sftp.port != new_sftp_port or curr_sftp.host != new_sftp_addr):
+                        logger.info(
+                            "SFTP configuration changed (%s:%d -> %s:%d); rebinding SFTP listener...",
+                            curr_sftp.host,
+                            curr_sftp.port,
+                            new_sftp_addr,
+                            new_sftp_port,
+                        )
+                        curr_sftp.rebind(new_sftp_addr, new_sftp_port)
+                        app.config["SFTP_BIND_PORT"] = new_sftp_port
+                        app.config["SFTP_BIND_ADDRESS"] = new_sftp_addr
+
+                    app.config["UPLOAD_LIMIT"] = new_settings.upload_limit
+            except Exception as err:
+                logger.debug("Config watcher error: %s", err)
+
+    import threading
+    threading.Thread(target=_config_watcher, daemon=True, name="pywings-config-watcher").start()
+
     @app.before_request
     def record_request_start():
         request._wings_start_time = time.monotonic()

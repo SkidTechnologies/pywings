@@ -6,9 +6,103 @@ import mimetypes
 import os
 from pathlib import Path
 import shutil
+import stat as pystat
 import tarfile
 import zipfile
 import uuid
+
+
+TEXT_EXTENSIONS = {
+    ".txt", ".log", ".cfg", ".conf", ".config", ".properties", ".ini", ".env",
+    ".yml", ".yaml", ".json", ".toml", ".xml", ".sh", ".bash", ".zsh", ".ash",
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".htm",
+    ".css", ".scss", ".sass", ".less", ".md", ".markdown", ".rst", ".sql",
+    ".lua", ".java", ".c", ".cpp", ".cc", ".h", ".hpp", ".rs", ".go", ".php",
+    ".rb", ".pl", ".r", ".csv", ".tsv", ".lock", ".editorconfig", ".gitignore",
+    ".gitattributes", ".gitmodules", ".dockerignore", ".npmrc", ".nvmrc", ".yarnrc",
+    ".bat", ".cmd", ".ps1", ".vbs", ".service", ".rules",
+}
+
+SPECIAL_TEXT_FILES = {
+    "dockerfile", "makefile", "procfile", "rakefile", "gemfile", "vagrantfile",
+    "license", "readme", "changelog", "authors", "contributors", "copying",
+}
+
+BINARY_EXTENSIONS = {
+    ".jar", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz",
+    ".7z", ".rar", ".iso", ".bin", ".exe", ".dll", ".so", ".dylib", ".png",
+    ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".mp3", ".mp4",
+    ".wav", ".ogg", ".flac", ".mkv", ".avi", ".pdf", ".sqlite", ".sqlite3",
+    ".db", ".dat", ".class", ".pyc", ".pyo", ".pyd", ".wasm", ".woff", ".woff2",
+    ".ttf", ".eot", ".otf",
+}
+
+
+def detect_mime(target: Path) -> str:
+    """Accurately identify file MIME types, ensuring text and config files are editable in Pterodactyl."""
+    if target.is_dir():
+        return "inode/directory"
+
+    name_lower = target.name.lower()
+    suffix_lower = target.suffix.lower()
+
+    if name_lower in SPECIAL_TEXT_FILES:
+        return "text/plain; charset=utf-8"
+
+    if suffix_lower in TEXT_EXTENSIONS:
+        if suffix_lower in (".yml", ".yaml"):
+            return "application/x-yaml"
+        if suffix_lower == ".json":
+            return "application/json"
+        if suffix_lower in (".html", ".htm"):
+            return "text/html"
+        if suffix_lower == ".xml":
+            return "application/xml"
+        if suffix_lower in (".sh", ".bash", ".zsh", ".ash"):
+            return "application/x-sh"
+        if suffix_lower in (".js", ".mjs", ".cjs"):
+            return "application/javascript"
+        if suffix_lower in (".ts", ".tsx"):
+            return "application/typescript"
+        if suffix_lower in (".css", ".scss", ".sass", ".less"):
+            return "text/css"
+        return "text/plain; charset=utf-8"
+
+    if suffix_lower in BINARY_EXTENSIONS:
+        guessed, _ = mimetypes.guess_type(target.name)
+        return guessed or "application/octet-stream"
+
+    # Content-based inspection (matching Go Wings mimetype.DetectReader)
+    try:
+        if not target.exists() or target.stat().st_size == 0:
+            return "text/plain; charset=utf-8"
+
+        with target.open("rb") as f:
+            sample = f.read(1024)
+
+        if not sample:
+            return "text/plain; charset=utf-8"
+
+        if b"\x00" in sample:
+            guessed, _ = mimetypes.guess_type(target.name)
+            return guessed or "application/octet-stream"
+
+        try:
+            sample.decode("utf-8")
+            return "text/plain; charset=utf-8"
+        except UnicodeDecodeError:
+            pass
+
+        try:
+            sample.decode("latin-1")
+            return "text/plain; charset=utf-8"
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    guessed, _ = mimetypes.guess_type(target.name)
+    return guessed or "text/plain; charset=utf-8"
 
 
 class FilesystemError(Exception):
@@ -33,17 +127,22 @@ class ServerFilesystem:
         except FileNotFoundError as error:
             raise FilesystemError("The requested resource was not found on the system.") from error
         is_directory = target.is_dir()
+        try:
+            mode_str = pystat.filemode(info.st_mode)
+        except Exception:
+            mode_str = "drwxr-xr-x" if is_directory else "-rw-r--r--"
+
         return {
             "name": target.name or "/",
             "created": datetime.fromtimestamp(info.st_ctime, timezone.utc).isoformat().replace("+00:00", "Z"),
             "modified": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "mode": "d---------" if is_directory else "----------",
+            "mode": mode_str,
             "mode_bits": format(info.st_mode & 0o777, "o"),
             "size": 0 if is_directory else info.st_size,
             "directory": is_directory,
             "file": not is_directory,
             "symlink": target.is_symlink(),
-            "mime": "inode/directory" if is_directory else (mimetypes.guess_type(target.name)[0] or "application/octet-stream"),
+            "mime": detect_mime(target),
         }
 
     def list_directory(self, directory: str) -> list[dict]:
@@ -64,12 +163,20 @@ class ServerFilesystem:
         if target.exists() and target.is_dir():
             raise FilesystemError("Cannot write file, name conflicts with an existing directory by the same name.")
         target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.chmod(0o777)
+        except OSError:
+            pass
         if target.exists():
             try:
                 target.chmod(0o666)
             except OSError:
                 pass
         target.write_bytes(content)
+        try:
+            target.chmod(0o666)
+        except OSError:
+            pass
 
     def upload(self, directory: str, uploads) -> list[dict]:
         """Store multipart uploads below the server root and return file stats."""

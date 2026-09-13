@@ -86,7 +86,23 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
         return target
 
     def _has_perm(self, perm: str) -> bool:
-        return "*" in self.permissions or perm in self.permissions
+        if "*" in self.permissions or "admin" in self.permissions:
+            return True
+        if perm in self.permissions:
+            return True
+        if perm.startswith("file.") and "file.*" in self.permissions:
+            return True
+        if perm in ("file.read", "file.read-content") and (
+            "file.read" in self.permissions or "file.read-content" in self.permissions
+        ):
+            return True
+        if perm in ("file.create", "file.update") and (
+            "file.create" in self.permissions
+            or "file.update" in self.permissions
+            or "file.write" in self.permissions
+        ):
+            return True
+        return False
 
     def list_folder(self, path: str) -> list[paramiko.SFTPAttributes] | int:
         if not self._has_perm("file.read"):
@@ -140,7 +156,7 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
         writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
         if writing and not (self._has_perm("file.create") or self._has_perm("file.update")):
             return paramiko.SFTP_PERMISSION_DENIED
-        if not writing and not self._has_perm("file.read-content"):
+        if not writing and not (self._has_perm("file.read-content") or self._has_perm("file.read")):
             return paramiko.SFTP_PERMISSION_DENIED
 
         mode = "rb"
@@ -152,8 +168,21 @@ class PteroSFTPInterface(paramiko.SFTPServerInterface):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists() and ("w" in mode or "+" in mode):
+            try:
+                target.parent.chmod(0o777)
+            except OSError:
+                pass
+            if target.exists():
+                try:
+                    target.chmod(0o666)
+                except OSError:
+                    pass
+            elif "w" in mode or "+" in mode:
                 target.touch()
+                try:
+                    target.chmod(0o666)
+                except OSError:
+                    pass
             f = target.open(mode)
             if "w" in mode or "+" in mode:
                 self._log_activity("server:sftp.write", {"file": path})
@@ -312,21 +341,53 @@ class SFTPServer:
         """Start SFTP server listener thread."""
         Thread(target=self._run, daemon=True).start()
 
+    def stop(self) -> None:
+        """Stop the SFTP listening socket and terminate the listener."""
+        self._running = False
+        sock = self._sock
+        self._sock = None
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def rebind(self, host: str, port: int) -> None:
+        """Rebind SFTP server to a new host/port on configuration change."""
+        new_port = int(port)
+        if self.host == host and self.port == new_port and self._running and self._sock:
+            return
+        logger.info("Rebinding SFTP server from %s:%d to %s:%d", self.host, self.port, host, new_port)
+        self.stop()
+        self.host = host
+        self.port = new_port
+        time.sleep(0.5)
+        self.start()
+
     def _run(self) -> None:
         self._running = True
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            self._sock.bind((self.host, self.port))
-            self._sock.listen(100)
+            sock.bind((self.host, self.port))
+            sock.listen(100)
+            self._sock = sock
             logger.info("SFTP server listening on %s:%d", self.host, self.port)
         except Exception as err:
             logger.error("Failed to bind SFTP server on %s:%d: %s", self.host, self.port, err)
+            try:
+                sock.close()
+            except Exception:
+                pass
             return
 
         while self._running:
             try:
-                client_sock, client_addr = self._sock.accept()
+                client_sock, client_addr = sock.accept()
                 Thread(target=self._handle_client, args=(client_sock, client_addr), daemon=True).start()
             except Exception:
                 if not self._running:
