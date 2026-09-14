@@ -96,26 +96,57 @@ class GameTunnelClient:
                     time.sleep(5)
 
     def _find_server_port(self, short_id: str) -> Optional[int]:
-        short_id = short_id.lower()
+        clean_target = short_id.lower().replace("-", "")
         if not self.store:
             return None
 
         for s in self.store.all():
-            if str(s.uuid).lower().startswith(short_id):
+            clean_uuid = str(s.uuid).lower().replace("-", "")
+            if clean_uuid.startswith(clean_target):
                 cfg = s.configuration or {}
-                allocs = cfg.get("allocations", {})
-                if isinstance(allocs, dict) and "default" in allocs:
-                    p = allocs["default"].get("port")
-                    if p:
-                        return int(p)
 
-                # Fallback to environment SERVER_PORT
-                env = cfg.get("environment", {})
-                if "SERVER_PORT" in env:
+                # 1. Check allocations["default"]["port"]
+                allocs = cfg.get("allocations") or {}
+                if isinstance(allocs, dict):
+                    def_alloc = allocs.get("default")
+                    if isinstance(def_alloc, dict) and def_alloc.get("port"):
+                        try:
+                            return int(def_alloc["port"])
+                        except Exception:
+                            pass
+                    # mappings: {"0.0.0.0": [25565]}
+                    mappings = allocs.get("mappings")
+                    if isinstance(mappings, dict):
+                        for port_list in mappings.values():
+                            if isinstance(port_list, (list, tuple)) and port_list:
+                                try:
+                                    return int(port_list[0])
+                                except Exception:
+                                    pass
+
+                # 2. Check environment["SERVER_PORT"]
+                env = cfg.get("environment") or {}
+                if isinstance(env, dict) and "SERVER_PORT" in env:
                     try:
                         return int(env["SERVER_PORT"])
                     except Exception:
                         pass
+
+                # 3. Direct check: server.properties on disk
+                try:
+                    data_dir = getattr(self.store, "data_directory", None)
+                    if data_dir:
+                        props_path = Path(data_dir) / str(s.uuid) / "server.properties"
+                        if props_path.is_file():
+                            for pline in props_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                                pline = pline.strip()
+                                if pline.startswith("server-port="):
+                                    p_val = pline.split("=", 1)[1].strip()
+                                    if p_val.isdigit():
+                                        return int(p_val)
+                except Exception:
+                    pass
+
         return None
 
     def _connect_and_listen(self) -> None:
@@ -126,7 +157,8 @@ class GameTunnelClient:
 
         # Rejestracja noda
         sock.sendall(f"REGISTER {self.node_id}\n".encode("utf-8"))
-        logger.info("PyWings Game Tunnel REGISTERED with %s:%d", self.router_host, self.router_port)
+        logger.info("PyWings Game Tunnel REGISTERED with %s:%d (Node ID: %s)",
+                    self.router_host, self.router_port, self.node_id)
 
         rfile = sock.makefile("r", encoding="utf-8")
         while self.running:
@@ -144,8 +176,8 @@ class GameTunnelClient:
                 s_id = parts[1].lower()
                 port = self._find_server_port(s_id)
                 if port:
-                    logger.info("Auto-resolved server %s to local port %d on node %s", s_id, port, self.node_id)
-                    sock.sendall(f"RESOLVED {s_id} {port}\n".encode("utf-8"))
+                    logger.info("Auto-resolved server %s to port %d on node %s", s_id, port, self.node_id)
+                    sock.sendall(f"RESOLVED {s_id} {port} {self.node_id}\n".encode("utf-8"))
 
             elif cmd == "OPEN" and len(parts) == 3:
                 stream_id = parts[1]
@@ -157,12 +189,33 @@ class GameTunnelClient:
                 ).start()
 
     def _bridge_stream(self, stream_id: str, target_port: int) -> None:
+        local_sock = None
+        router_sock = None
         try:
-            # 1. Połącz z lokalnym serwerem gry na nodzie (127.0.0.1:port)
-            local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            local_sock.settimeout(3.0)
-            local_sock.connect(("127.0.0.1", target_port))
-            local_sock.settimeout(None)
+            # 1. Połącz z lokalnym serwerem gry na nodzie (próba 127.0.0.1, localhost)
+            connected = False
+            for host_cand in ("127.0.0.1", "localhost"):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2.5)
+                    s.connect((host_cand, target_port))
+                    s.settimeout(None)
+                    local_sock = s
+                    connected = True
+                    break
+                except Exception:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+            if not connected:
+                logger.warning(
+                    "[GameTunnel] Cannot connect to local Minecraft server on port %d! "
+                    "Make sure the server is ONLINE in Pterodactyl!",
+                    target_port,
+                )
+                return
 
             # 2. Otwórz dedykowany socket mostkujący do routera
             router_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -174,7 +227,18 @@ class GameTunnelClient:
             router_sock.sendall(f"BRIDGE {stream_id}\n".encode("utf-8"))
 
             # 4. Mostkuj strumień lokalnego serwera Minecraft z routerem
+            logger.info("[GameTunnel] Bridging stream %s to local port %d", stream_id, target_port)
             bridge_sockets(local_sock, router_sock)
 
         except Exception as err:
-            logger.debug("Failed bridging stream %s to 127.0.0.1:%d: %s", stream_id, target_port, err)
+            logger.warning("[GameTunnel] Error bridging stream %s to port %d: %s", stream_id, target_port, err)
+            if local_sock:
+                try:
+                    local_sock.close()
+                except Exception:
+                    pass
+            if router_sock:
+                try:
+                    router_sock.close()
+                except Exception:
+                    pass
