@@ -188,6 +188,21 @@ class ClusterSFTPClient:
                 daemon=True,
             ).start()
 
+    def owns_server(self, short_id: str) -> Optional[str]:
+        """Check if this node owns a server starting with short_id (8 chars)."""
+        short_id = short_id.lower()
+        if self.store:
+            for s in self.store.all():
+                if str(s.uuid).lower().startswith(short_id):
+                    return s.uuid
+        try:
+            for p in self.data_directory.iterdir():
+                if p.is_dir() and p.name.lower().startswith(short_id):
+                    return p.name
+        except Exception:
+            pass
+        return None
+
     def _handle_command(self, meta: dict, payload: bytes) -> None:
         msg_type = meta.get("type")
         req_id = meta.get("req_id")
@@ -196,6 +211,20 @@ class ClusterSFTPClient:
             username = meta["username"]
             password = meta["password"]
             client_ip = meta.get("client_ip", "127.0.0.1")
+
+            # Extract short server identifier from username (user.id8)
+            parts = username.rsplit(".", 1)
+            if len(parts) == 2 and len(parts[1]) == 8:
+                short_id = parts[1].lower()
+                # Fast check: if this node doesn't own this server, reject immediately (0ms)
+                # This prevents all 13 nodes from spamming the Panel API simultaneously!
+                if not self.owns_server(short_id):
+                    self._safe_send({
+                        "type": "auth_res",
+                        "req_id": req_id,
+                        "status": "not_mine",
+                    })
+                    return
 
             if not self.remote_client or not self.store:
                 self._safe_send({
@@ -206,14 +235,44 @@ class ClusterSFTPClient:
                 return
 
             try:
+                logger.info("Server in %s belongs to this node (%s)! Validating credentials with Panel...", username, self.node_id)
                 auth_info = self.remote_client.validate_sftp_credentials(
                     username=username,
                     password=password,
                     client_ip=client_ip,
                 )
                 server_uuid = auth_info.get("server")
-                if server_uuid and self.store.get(server_uuid):
-                    logger.info("Cluster SFTP auth MATCHED for %s (server: %s)", username, server_uuid)
+                if not server_uuid:
+                    self._safe_send({
+                        "type": "auth_res",
+                        "req_id": req_id,
+                        "status": "not_mine",
+                    })
+                    return
+
+                # Robust case-insensitive check in store or on disk
+                matched_uuid = None
+                srv = self.store.get(server_uuid) or self.store.get(str(server_uuid).lower()) or self.store.get(str(server_uuid).upper())
+                if srv:
+                    matched_uuid = srv.uuid
+                else:
+                    for s in self.store.all():
+                        if str(s.uuid).lower() == str(server_uuid).lower():
+                            matched_uuid = s.uuid
+                            break
+
+                if not matched_uuid:
+                    try:
+                        for p in self.data_directory.iterdir():
+                            if p.is_dir() and p.name.lower() == str(server_uuid).lower():
+                                matched_uuid = p.name
+                                break
+                    except Exception:
+                        pass
+
+                if matched_uuid:
+                    auth_info["server"] = matched_uuid
+                    logger.info("Cluster SFTP auth MATCHED for %s (server: %s) on node %s", username, matched_uuid, self.node_id)
                     self._safe_send({
                         "type": "auth_res",
                         "req_id": req_id,
@@ -221,6 +280,7 @@ class ClusterSFTPClient:
                         "auth_info": auth_info,
                     })
                 else:
+                    logger.warning("Panel validated %s but server %s not found in store/disk on node %s", username, server_uuid, self.node_id)
                     self._safe_send({
                         "type": "auth_res",
                         "req_id": req_id,
