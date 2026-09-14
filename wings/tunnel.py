@@ -188,16 +188,40 @@ class GameTunnelClient:
                     daemon=True,
                 ).start()
 
+    def _get_candidate_hosts(self, target_port: int) -> list[str]:
+        hosts = ["127.0.0.1", "localhost"]
+        try:
+            hname = socket.gethostname()
+            for info in socket.getaddrinfo(hname, None, socket.AF_INET):
+                ip = info[4][0]
+                if ip and ip not in hosts:
+                    hosts.append(ip)
+        except Exception:
+            pass
+
+        if self.store:
+            for s in self.store.all():
+                cfg = s.configuration or {}
+                allocs = cfg.get("allocations") or {}
+                if isinstance(allocs, dict):
+                    def_alloc = allocs.get("default") or {}
+                    if def_alloc.get("port") == target_port and def_alloc.get("ip"):
+                        cand = str(def_alloc["ip"]).strip()
+                        if cand and cand != "0.0.0.0" and cand not in hosts:
+                            hosts.append(cand)
+        return hosts
+
     def _bridge_stream(self, stream_id: str, target_port: int) -> None:
         local_sock = None
         router_sock = None
         try:
-            # 1. Połącz z lokalnym serwerem gry na nodzie (próba 127.0.0.1, localhost)
+            # 1. Połącz z lokalnym serwerem gry na nodzie (próba 127.0.0.1, localhost, IP interfejsów)
+            candidates = self._get_candidate_hosts(target_port)
             connected = False
-            for host_cand in ("127.0.0.1", "localhost"):
+            for host_cand in candidates:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(2.5)
+                    s.settimeout(2.0)
                     s.connect((host_cand, target_port))
                     s.settimeout(None)
                     local_sock = s
@@ -211,10 +235,19 @@ class GameTunnelClient:
 
             if not connected:
                 logger.warning(
-                    "[GameTunnel] Cannot connect to local Minecraft server on port %d! "
-                    "Make sure the server is ONLINE in Pterodactyl!",
-                    target_port,
+                    "[GameTunnel] Cannot connect to local Minecraft server on port %d (checked: %s)! "
+                    "Make sure the server is ONLINE and RUNNING in Pterodactyl!",
+                    target_port, candidates,
                 )
+                # Otwórz i zamknij bridge z informacją o błędzie, żeby router nie czekał 5s
+                try:
+                    fail_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    fail_sock.settimeout(2.0)
+                    fail_sock.connect((self.router_host, self.router_port))
+                    fail_sock.sendall(f"BRIDGE {stream_id} FAIL\n".encode("utf-8"))
+                    fail_sock.close()
+                except Exception:
+                    pass
                 return
 
             # 2. Otwórz dedykowany socket mostkujący do routera
