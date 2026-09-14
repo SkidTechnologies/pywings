@@ -145,6 +145,8 @@ def create_app(settings: Settings | None = None) -> Flask:
             router_port=int(os.getenv("GAME_TUNNEL_PORT", 2782)),
             node_id=str(app.config.get("UUID") or ""),
             store=app.extensions.get("server_store"),
+            data_directory=app.config.get("DATA_DIRECTORY"),
+            remote_client=remote_client,
         )
         game_tunnel.start()
         app.extensions["game_tunnel"] = game_tunnel
