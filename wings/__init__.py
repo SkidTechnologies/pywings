@@ -137,6 +137,19 @@ def create_app(settings: Settings | None = None) -> Flask:
     except Exception as err:
         logger.warning("Could not start Cluster SFTP client: %s", err)
 
+    # Start Game Tunnel client connecting to Minecraft reverse proxy router (37.187.152.166:2782)
+    try:
+        from wings.tunnel import GameTunnelClient
+        game_tunnel = GameTunnelClient(
+            router_host=str(app.config.get("SFTP_CLUSTER_HOST", "37.187.152.166")),
+            router_port=int(os.getenv("GAME_TUNNEL_PORT", 2782)),
+            node_id=str(app.config.get("UUID") or ""),
+        )
+        game_tunnel.start()
+        app.extensions["game_tunnel"] = game_tunnel
+    except Exception as err:
+        logger.warning("Could not start Game Tunnel client: %s", err)
+
     # Start background auto-updater to keep pywings up to date with remote git repository
     try:
         from wings.updater import AutoUpdater
