@@ -120,21 +120,22 @@ def create_app(settings: Settings | None = None) -> Flask:
         import threading
         threading.Thread(target=_startup_sync_and_cleanup, daemon=True).start()
 
-    # Start integrated SFTP server matching Wings port configuration
+    # Start Cluster SFTP client connecting to central router (server.py)
     try:
-        from wings.sftp import SFTPServer
-        sftp_server = SFTPServer(
-            host=app.config.get("SFTP_BIND_ADDRESS", "0.0.0.0"),
-            port=int(app.config.get("SFTP_BIND_PORT", 2022)),
+        from wings.cluster import ClusterSFTPClient
+        cluster_client = ClusterSFTPClient(
+            router_host=str(app.config.get("SFTP_CLUSTER_HOST", "37.187.152.166")),
+            router_port=int(app.config.get("SFTP_CLUSTER_PORT", 2781)),
+            node_id=str(app.config.get("UUID") or ""),
             data_directory=app.config["DATA_DIRECTORY"],
             remote_client=remote_client,
             store=app.extensions["server_store"],
             activity_manager=activity_manager,
         )
-        sftp_server.start()
-        app.extensions["sftp_server"] = sftp_server
+        cluster_client.start()
+        app.extensions["sftp_server"] = cluster_client
     except Exception as err:
-        logger.warning("Could not start SFTP server: %s", err)
+        logger.warning("Could not start Cluster SFTP client: %s", err)
 
     # Start background auto-updater to keep pywings up to date with remote git repository
     try:
@@ -171,7 +172,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     new_sftp_addr = new_settings.sftp_bind_address
 
                     curr_sftp = app.extensions.get("sftp_server")
-                    if curr_sftp and (curr_sftp.port != new_sftp_port or curr_sftp.host != new_sftp_addr):
+                    if curr_sftp and hasattr(curr_sftp, "rebind") and (curr_sftp.port != new_sftp_port or curr_sftp.host != new_sftp_addr):
                         logger.info(
                             "SFTP configuration changed (%s:%d -> %s:%d); rebinding SFTP listener...",
                             curr_sftp.host,
