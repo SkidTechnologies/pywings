@@ -58,6 +58,8 @@ class Settings:
     data_directory: str = "./data"
     sftp_bind_port: int = 2022
     sftp_bind_address: str = "0.0.0.0"
+    sftp_cluster_host: str = "37.187.152.166"
+    sftp_cluster_port: int = 2781
     allowed_mounts: tuple[str, ...] = ()
     remote: str = ""
     version: str = "1.0.23-pywings"
@@ -146,6 +148,9 @@ class Settings:
         raw_sftp_address = str(_env("WINGS_SFTP_ADDRESS", _env("SFTP_BIND_ADDRESS", _env("SFTP_ADDRESS", sftp_addr_val))))
         clean_sftp_address = raw_sftp_address.partition(":")[0] if ":" in raw_sftp_address and not raw_sftp_address.startswith("[") else raw_sftp_address
 
+        cluster_host = str(_env("SFTP_CLUSTER_HOST", values.get("sftp_cluster_host", "37.187.152.166")))
+        cluster_port = _env_int("SFTP_CLUSTER_PORT", int(values.get("sftp_cluster_port", 2781)))
+
         return cls(
             debug=_env_bool("WINGS_DEBUG", bool(values.get("debug", False))),
             uuid=str(_env("WINGS_UUID", values.get("uuid", ""))),
@@ -160,6 +165,8 @@ class Settings:
             data_directory=str(data_directory.resolve()),
             sftp_bind_port=sftp_port,
             sftp_bind_address=clean_sftp_address,
+            sftp_cluster_host=cluster_host,
+            sftp_cluster_port=cluster_port,
             allowed_mounts=tuple(allowed_mounts_list or [str(item) for item in (values.get("allowed_mounts") or [])]),
             remote=str(_env("WINGS_REMOTE", values.get("remote", ""))),
             version=str(_env("WINGS_VERSION", _get_version())),
@@ -184,6 +191,8 @@ class Settings:
             "DATA_DIRECTORY": self.data_directory,
             "SFTP_BIND_PORT": self.sftp_bind_port,
             "SFTP_BIND_ADDRESS": self.sftp_bind_address,
+            "SFTP_CLUSTER_HOST": self.sftp_cluster_host,
+            "SFTP_CLUSTER_PORT": self.sftp_cluster_port,
             "ALLOWED_MOUNTS": self.allowed_mounts,
             "CONFIG_PATH": str(self.config_path),
             "PROOT_PATH": self.proot_path,
