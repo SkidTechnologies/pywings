@@ -56,11 +56,15 @@ class GameTunnelClient:
         router_port: int = DEFAULT_TUNNEL_PORT,
         node_id: str = "",
         store: Any = None,
+        data_directory: Any = None,
+        remote_client: Any = None,
     ):
         self.router_host = router_host
         self.router_port = int(router_port)
         self.node_id = node_id or socket.gethostname()
         self.store = store
+        self.data_directory = Path(data_directory) if data_directory else None
+        self.remote_client = remote_client
         self.running = False
         self.control_sock: Optional[socket.socket] = None
 
@@ -97,55 +101,81 @@ class GameTunnelClient:
 
     def _find_server_port(self, short_id: str) -> Optional[int]:
         clean_target = short_id.lower().replace("-", "")
-        if not self.store:
-            return None
 
-        for s in self.store.all():
-            clean_uuid = str(s.uuid).lower().replace("-", "")
-            if clean_uuid.startswith(clean_target):
-                cfg = s.configuration or {}
+        # 1. Sprawdź obiekty w pamięci ServerStore
+        if self.store:
+            for s in self.store.all():
+                clean_uuid = str(s.uuid).lower().replace("-", "")
+                if clean_uuid.startswith(clean_target):
+                    cfg = s.configuration or {}
 
-                # 1. Check allocations["default"]["port"]
-                allocs = cfg.get("allocations") or {}
-                if isinstance(allocs, dict):
-                    def_alloc = allocs.get("default")
-                    if isinstance(def_alloc, dict) and def_alloc.get("port"):
+                    allocs = cfg.get("allocations") or {}
+                    if isinstance(allocs, dict):
+                        def_alloc = allocs.get("default")
+                        if isinstance(def_alloc, dict) and def_alloc.get("port"):
+                            try:
+                                return int(def_alloc["port"])
+                            except Exception:
+                                pass
+                        mappings = allocs.get("mappings")
+                        if isinstance(mappings, dict):
+                            for port_list in mappings.values():
+                                if isinstance(port_list, (list, tuple)) and port_list:
+                                    try:
+                                        return int(port_list[0])
+                                    except Exception:
+                                        pass
+
+                    env = cfg.get("environment") or {}
+                    if isinstance(env, dict) and "SERVER_PORT" in env:
                         try:
-                            return int(def_alloc["port"])
+                            return int(env["SERVER_PORT"])
                         except Exception:
                             pass
-                    # mappings: {"0.0.0.0": [25565]}
-                    mappings = allocs.get("mappings")
-                    if isinstance(mappings, dict):
-                        for port_list in mappings.values():
-                            if isinstance(port_list, (list, tuple)) and port_list:
-                                try:
-                                    return int(port_list[0])
-                                except Exception:
-                                    pass
 
-                # 2. Check environment["SERVER_PORT"]
-                env = cfg.get("environment") or {}
-                if isinstance(env, dict) and "SERVER_PORT" in env:
-                    try:
-                        return int(env["SERVER_PORT"])
-                    except Exception:
-                        pass
+        # 2. Przeszukaj fizyczne katalogi na dysku (nawet jeśli serwer nie jest w RAM-ie)
+        data_candidates = []
+        if self.store and getattr(self.store, "data_directory", None):
+            data_candidates.append(Path(self.store.data_directory))
+        if self.data_directory:
+            data_candidates.append(self.data_directory)
+        data_candidates.extend([
+            Path("/var/lib/pterodactyl/volumes"),
+            Path("/srv/daemon-data"),
+            Path("./data"),
+        ])
 
-                # 3. Direct check: server.properties on disk
-                try:
-                    data_dir = getattr(self.store, "data_directory", None)
-                    if data_dir:
-                        props_path = Path(data_dir) / str(s.uuid) / "server.properties"
-                        if props_path.is_file():
-                            for pline in props_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for dpath in data_candidates:
+            try:
+                if not dpath.is_dir():
+                    continue
+                for entry in dpath.iterdir():
+                    if entry.is_dir() and entry.name.lower().replace("-", "").startswith(clean_target):
+                        props_file = entry / "server.properties"
+                        if props_file.is_file():
+                            for pline in props_file.read_text(encoding="utf-8", errors="ignore").splitlines():
                                 pline = pline.strip()
                                 if pline.startswith("server-port="):
                                     p_val = pline.split("=", 1)[1].strip()
                                     if p_val.isdigit():
                                         return int(p_val)
-                except Exception:
-                    pass
+            except Exception:
+                pass
+
+        # 3. Zapytaj Panel Pterodactyl przez remote_client (jeśli dostępny)
+        if self.remote_client:
+            try:
+                panel_servers = self.remote_client.get_servers()
+                if panel_servers:
+                    for item in panel_servers:
+                        u = item.get("uuid") or (item.get("settings") or {}).get("uuid") or ""
+                        if str(u).lower().replace("-", "").startswith(clean_target):
+                            # Znaleziono serwer w panelu
+                            allocs = item.get("allocations") or (item.get("settings") or {}).get("allocations") or {}
+                            if isinstance(allocs, dict) and "default" in allocs:
+                                return int(allocs["default"]["port"])
+            except Exception:
+                pass
 
         return None
 
