@@ -155,10 +155,11 @@ class GameTunnelClient:
         sock.connect((self.router_host, self.router_port))
         self.control_sock = sock
 
-        # Rejestracja noda
-        sock.sendall(f"REGISTER {self.node_id}\n".encode("utf-8"))
-        logger.info("PyWings Game Tunnel REGISTERED with %s:%d (Node ID: %s)",
-                    self.router_host, self.router_port, self.node_id)
+        # Rejestracja noda ze wszystkimi identyfikatorami (UUID + hostname)
+        hname = socket.gethostname()
+        sock.sendall(f"REGISTER {self.node_id} {hname}\n".encode("utf-8"))
+        logger.info("PyWings Game Tunnel REGISTERED with %s:%d (UUID: %s, Hostname: %s)",
+                    self.router_host, self.router_port, self.node_id, hname)
 
         rfile = sock.makefile("r", encoding="utf-8")
         while self.running:
@@ -176,8 +177,8 @@ class GameTunnelClient:
                 s_id = parts[1].lower()
                 port = self._find_server_port(s_id)
                 if port:
-                    logger.info("Auto-resolved server %s to port %d on node %s", s_id, port, self.node_id)
-                    sock.sendall(f"RESOLVED {s_id} {port} {self.node_id}\n".encode("utf-8"))
+                    logger.info("Auto-resolved server %s to port %d on node %s (%s)", s_id, port, self.node_id, hname)
+                    sock.sendall(f"RESOLVED {s_id} {port} {self.node_id} {hname}\n".encode("utf-8"))
 
             elif cmd == "OPEN" and len(parts) == 3:
                 stream_id = parts[1]
