@@ -144,6 +144,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             router_host=str(app.config.get("SFTP_CLUSTER_HOST", "37.187.152.166")),
             router_port=int(os.getenv("GAME_TUNNEL_PORT", 2782)),
             node_id=str(app.config.get("UUID") or ""),
+            store=app.extensions.get("server_store"),
         )
         game_tunnel.start()
         app.extensions["game_tunnel"] = game_tunnel
