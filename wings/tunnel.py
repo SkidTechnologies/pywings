@@ -2,6 +2,7 @@
 
 Maintains persistent reverse tunnel to the central Minecraft router (37.187.152.166:2782).
 Allows game servers to run purely locally on 127.0.0.1 without exposing ANY open ports to the internet.
+Supports auto-resolving server ports on demand.
 """
 
 import logging
@@ -9,7 +10,7 @@ import select
 import socket
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("wings.tunnel")
 
@@ -49,10 +50,17 @@ def bridge_sockets(s1: socket.socket, s2: socket.socket) -> None:
 class GameTunnelClient:
     """Connects to central router tunnel port and handles local socket bridging."""
 
-    def __init__(self, router_host: str = DEFAULT_ROUTER_HOST, router_port: int = DEFAULT_TUNNEL_PORT, node_id: str = ""):
+    def __init__(
+        self,
+        router_host: str = DEFAULT_ROUTER_HOST,
+        router_port: int = DEFAULT_TUNNEL_PORT,
+        node_id: str = "",
+        store: Any = None,
+    ):
         self.router_host = router_host
         self.router_port = int(router_port)
         self.node_id = node_id or socket.gethostname()
+        self.store = store
         self.running = False
         self.control_sock: Optional[socket.socket] = None
 
@@ -87,6 +95,29 @@ class GameTunnelClient:
                     logger.warning("Game Tunnel disconnected/failed (%s); retrying in 5s...", err)
                     time.sleep(5)
 
+    def _find_server_port(self, short_id: str) -> Optional[int]:
+        short_id = short_id.lower()
+        if not self.store:
+            return None
+
+        for s in self.store.all():
+            if str(s.uuid).lower().startswith(short_id):
+                cfg = s.configuration or {}
+                allocs = cfg.get("allocations", {})
+                if isinstance(allocs, dict) and "default" in allocs:
+                    p = allocs["default"].get("port")
+                    if p:
+                        return int(p)
+
+                # Fallback to environment SERVER_PORT
+                env = cfg.get("environment", {})
+                if "SERVER_PORT" in env:
+                    try:
+                        return int(env["SERVER_PORT"])
+                    except Exception:
+                        pass
+        return None
+
     def _connect_and_listen(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -104,7 +135,19 @@ class GameTunnelClient:
                 break
 
             parts = line.strip().split()
-            if len(parts) == 3 and parts[0].upper() == "OPEN":
+            if not parts:
+                continue
+
+            cmd = parts[0].upper()
+
+            if cmd == "RESOLVE" and len(parts) >= 2:
+                s_id = parts[1].lower()
+                port = self._find_server_port(s_id)
+                if port:
+                    logger.info("Auto-resolved server %s to local port %d on node %s", s_id, port, self.node_id)
+                    sock.sendall(f"RESOLVED {s_id} {port}\n".encode("utf-8"))
+
+            elif cmd == "OPEN" and len(parts) == 3:
                 stream_id = parts[1]
                 target_port = int(parts[2])
                 threading.Thread(
