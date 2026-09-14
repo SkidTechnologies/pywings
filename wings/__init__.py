@@ -1,268 +1,180 @@
-"""Python implementation of the Pterodactyl Wings control plane."""
+"""PyWings Game Tunnel Client.
 
-from flask import Flask, request
-from flask_sock import Sock
-from pathlib import Path
+Maintains persistent reverse tunnel to the central Minecraft router (37.187.152.166:2782).
+Allows game servers to run purely locally on 127.0.0.1 without exposing ANY open ports to the internet.
+Supports auto-resolving server ports on demand.
+"""
+
 import logging
-import os
+import select
+import socket
+import threading
 import time
-import uuid
+from typing import Any, Optional
 
-from wings.config import Settings
-from wings.logger import setup_logging
-from wings.servers import ServerStore
-from wings.processes import ProcessManager
-from wings.runtime import ProotRuntime
-from wings.remote import PanelRemoteClient
+logger = logging.getLogger("wings.tunnel")
+
+DEFAULT_ROUTER_HOST = "37.187.152.166"
+DEFAULT_TUNNEL_PORT = 2782
 
 
-logger = logging.getLogger("wings")
-http_logger = logging.getLogger("wings.http")
-
-
-def create_app(settings: Settings | None = None) -> Flask:
-    """Create and configure the Wings Flask application.
-
-    Keeping application creation in a factory makes the service easy to test and
-    leaves room for multiple configurations in later stages.
-    """
-    app = Flask(__name__)
-    app.config.from_mapping((settings or Settings.from_file()).as_flask_config())
-
-    # Initialize extended console logging matching Wings format
-    setup_logging(bool(app.config.get("DEBUG", False)))
-
-    app.config["MAX_CONTENT_LENGTH"] = int(app.config["UPLOAD_LIMIT"]) * 1024 * 1024
-    app.extensions["server_store"] = ServerStore(app.config["DATA_DIRECTORY"])
-    remote_client = PanelRemoteClient(
-        app.config["PANEL_LOCATION"], app.config["TOKEN_ID"], app.config["TOKEN"]
-    )
-    app.extensions["remote_client"] = remote_client
-    runtime_data_dir = Path(app.config["DATA_DIRECTORY"]).resolve() / "runtime"
-    proot_custom_path = app.config.get("PROOT_PATH") or None
-    runtime = ProotRuntime(data_directory=runtime_data_dir, proot_path=proot_custom_path)
-    app.extensions["container_runtime"] = runtime
-
-    # Initialize activity event manager
-    activity_manager = None
+def bridge_sockets(s1: socket.socket, s2: socket.socket) -> None:
     try:
-        from wings.activity import ActivityManager
-        activity_manager = ActivityManager(remote_client=remote_client)
-        activity_manager.start()
-        app.extensions["activity_manager"] = activity_manager
-    except Exception as err:
-        logger.warning("Could not start activity manager: %s", err)
-
-    app.extensions["process_manager"] = ProcessManager(
-        app.extensions["server_store"],
-        runtime,
-        app.config["ALLOWED_MOUNTS"],
-        remote_client=remote_client,
-        activity_manager=activity_manager,
-    )
-    sock = Sock(app)
-
-    # Reset server states and clean up deleted servers & unused egg images on boot
-    def _startup_sync_and_cleanup():
-        if not app.config["PANEL_LOCATION"]:
-            return
-        remote_client.reset_servers_state()
-        time.sleep(3)
+        while True:
+            r, _, _ = select.select([s1, s2], [], [], 60)
+            if not r:
+                break
+            if s1 in r:
+                data = s1.recv(65536)
+                if not data:
+                    break
+                s2.sendall(data)
+            if s2 in r:
+                data = s2.recv(65536)
+                if not data:
+                    break
+                s1.sendall(data)
+    except Exception:
+        pass
+    finally:
         try:
-            panel_servers = remote_client.get_servers()
-            if not panel_servers:
-                return
-            panel_uuids = set()
-            for item in panel_servers:
-                u = item.get("uuid") or (item.get("settings") or {}).get("uuid") or (item.get("attributes") or {}).get("uuid")
-                if u:
-                    panel_uuids.add(str(u).lower())
+            s1.close()
+        except Exception:
+            pass
+        try:
+            s2.close()
+        except Exception:
+            pass
 
-            if not panel_uuids:
-                return
 
-            pm = app.extensions.get("process_manager")
-            store = app.extensions.get("server_store")
-            if not pm or not store:
-                return
+class GameTunnelClient:
+    """Connects to central router tunnel port and handles local socket bridging."""
 
-            # Clean up local directories on disk for servers deleted in Panel
-            data_dir = Path(app.config["DATA_DIRECTORY"]).resolve()
-            if data_dir.is_dir():
-                for entry in data_dir.iterdir():
-                    if entry.is_dir() and len(entry.name) == 36 and entry.name.count("-") == 4:
-                        if entry.name.lower() not in panel_uuids:
-                            logger.info("Cleaning up unlisted server directory on disk: %s", entry.name)
-                            pm.remove(entry.name, purge_files=True)
+    def __init__(
+        self,
+        router_host: str = DEFAULT_ROUTER_HOST,
+        router_port: int = DEFAULT_TUNNEL_PORT,
+        node_id: str = "",
+        store: Any = None,
+    ):
+        self.router_host = router_host
+        self.router_port = int(router_port)
+        self.node_id = node_id or socket.gethostname()
+        self.store = store
+        self.running = False
+        self.control_sock: Optional[socket.socket] = None
 
-            # Clean up server records in store for deleted servers
-            for srv in store.all():
-                if srv.uuid.lower() not in panel_uuids:
-                    logger.info("Cleaning up unlisted server from local store: %s", srv.uuid)
-                    pm.remove(srv.uuid, purge_files=True)
+    def start(self) -> None:
+        self.running = True
+        t = threading.Thread(target=self._run_loop, daemon=True, name="pywings-game-tunnel")
+        t.start()
 
-            # Clean up unreferenced/unused OCI egg images and rootfs directories
+    def stop(self) -> None:
+        self.running = False
+        sock = self.control_sock
+        self.control_sock = None
+        if sock:
             try:
-                active_images = set()
-                for srv in store.all():
-                    cfg = srv.configuration or {}
-                    img = (cfg.get("container") or {}).get("image") or cfg.get("image")
-                    if img:
-                        active_images.add(str(img).strip())
-                pm.runtime.oci_manager.prune_unused_images(active_images)
-            except Exception as prune_err:
-                logger.debug("Image rootfs prune encountered error: %s", prune_err)
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _run_loop(self) -> None:
+        logger.info("Starting PyWings Game Tunnel targeting %s:%d (Node ID: %s)...",
+                    self.router_host, self.router_port, self.node_id)
+
+        while self.running:
+            try:
+                self._connect_and_listen()
+            except Exception as err:
+                if self.running:
+                    logger.warning("Game Tunnel disconnected/failed (%s); retrying in 5s...", err)
+                    time.sleep(5)
+
+    def _find_server_port(self, short_id: str) -> Optional[int]:
+        short_id = short_id.lower()
+        if not self.store:
+            return None
+
+        for s in self.store.all():
+            if str(s.uuid).lower().startswith(short_id):
+                cfg = s.configuration or {}
+                allocs = cfg.get("allocations", {})
+                if isinstance(allocs, dict) and "default" in allocs:
+                    p = allocs["default"].get("port")
+                    if p:
+                        return int(p)
+
+                # Fallback to environment SERVER_PORT
+                env = cfg.get("environment", {})
+                if "SERVER_PORT" in env:
+                    try:
+                        return int(env["SERVER_PORT"])
+                    except Exception:
+                        pass
+        return None
+
+    def _connect_and_listen(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.connect((self.router_host, self.router_port))
+        self.control_sock = sock
+
+        # Rejestracja noda
+        sock.sendall(f"REGISTER {self.node_id}\n".encode("utf-8"))
+        logger.info("PyWings Game Tunnel REGISTERED with %s:%d", self.router_host, self.router_port)
+
+        rfile = sock.makefile("r", encoding="utf-8")
+        while self.running:
+            line = rfile.readline()
+            if not line:
+                break
+
+            parts = line.strip().split()
+            if not parts:
+                continue
+
+            cmd = parts[0].upper()
+
+            if cmd == "RESOLVE" and len(parts) >= 2:
+                s_id = parts[1].lower()
+                port = self._find_server_port(s_id)
+                if port:
+                    logger.info("Auto-resolved server %s to local port %d on node %s", s_id, port, self.node_id)
+                    sock.sendall(f"RESOLVED {s_id} {port}\n".encode("utf-8"))
+
+            elif cmd == "OPEN" and len(parts) == 3:
+                stream_id = parts[1]
+                target_port = int(parts[2])
+                threading.Thread(
+                    target=self._bridge_stream,
+                    args=(stream_id, target_port),
+                    daemon=True,
+                ).start()
+
+    def _bridge_stream(self, stream_id: str, target_port: int) -> None:
+        try:
+            # 1. Połącz z lokalnym serwerem gry na nodzie (127.0.0.1:port)
+            local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            local_sock.settimeout(3.0)
+            local_sock.connect(("127.0.0.1", target_port))
+            local_sock.settimeout(None)
+
+            # 2. Otwórz dedykowany socket mostkujący do routera
+            router_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            router_sock.settimeout(4.0)
+            router_sock.connect((self.router_host, self.router_port))
+            router_sock.settimeout(None)
+
+            # 3. Zgłoś stream_id
+            router_sock.sendall(f"BRIDGE {stream_id}\n".encode("utf-8"))
+
+            # 4. Mostkuj strumień lokalnego serwera Minecraft z routerem
+            bridge_sockets(local_sock, router_sock)
 
         except Exception as err:
-            logger.warning("Startup sync & cleanup failed: %s", err)
-
-    if app.config["PANEL_LOCATION"]:
-        import threading
-        threading.Thread(target=_startup_sync_and_cleanup, daemon=True).start()
-
-    # Start Cluster SFTP client connecting to central router (server.py)
-    try:
-        from wings.cluster import ClusterSFTPClient
-        cluster_client = ClusterSFTPClient(
-            router_host=str(app.config.get("SFTP_CLUSTER_HOST", "37.187.152.166")),
-            router_port=int(app.config.get("SFTP_CLUSTER_PORT", 2781)),
-            node_id=str(app.config.get("UUID") or ""),
-            data_directory=app.config["DATA_DIRECTORY"],
-            remote_client=remote_client,
-            store=app.extensions["server_store"],
-            activity_manager=activity_manager,
-        )
-        cluster_client.start()
-        app.extensions["sftp_server"] = cluster_client
-    except Exception as err:
-        logger.warning("Could not start Cluster SFTP client: %s", err)
-
-    # Start Game Tunnel client connecting to Minecraft reverse proxy router (37.187.152.166:2782)
-    try:
-        from wings.tunnel import GameTunnelClient
-        game_tunnel = GameTunnelClient(
-            router_host=str(app.config.get("SFTP_CLUSTER_HOST", "37.187.152.166")),
-            router_port=int(os.getenv("GAME_TUNNEL_PORT", 2782)),
-            node_id=str(app.config.get("UUID") or ""),
-            store=app.extensions.get("server_store"),
-        )
-        game_tunnel.start()
-        app.extensions["game_tunnel"] = game_tunnel
-    except Exception as err:
-        logger.warning("Could not start Game Tunnel client: %s", err)
-
-    # Start background auto-updater to keep pywings up to date with remote git repository
-    try:
-        from wings.updater import AutoUpdater
-        updater = AutoUpdater(
-            app=app,
-            interval_seconds=int(os.getenv("WINGS_UPDATE_INTERVAL", 60)),
-            enabled=os.getenv("WINGS_AUTO_UPDATE", "true").lower() in {"1", "true", "yes", "on"},
-        )
-        updater.start()
-        app.extensions["updater"] = updater
-    except Exception as err:
-        logger.warning("Could not initialize auto-updater: %s", err)
-
-    # Monitor config.yml for live SFTP port/address or settings updates
-    def _config_watcher():
-        cfg_path_str = app.config.get("CONFIG_PATH")
-        if not cfg_path_str:
-            return
-        cfg_path = Path(cfg_path_str)
-        last_mtime = cfg_path.stat().st_mtime if cfg_path.exists() else 0.0
-
-        while True:
-            time.sleep(5)
-            try:
-                if not cfg_path.exists():
-                    continue
-                current_mtime = cfg_path.stat().st_mtime
-                if current_mtime > last_mtime:
-                    last_mtime = current_mtime
-                    logger.info("Detected change in %s; reloading configuration...", cfg_path.name)
-                    new_settings = Settings.from_file(cfg_path)
-                    new_sftp_port = new_settings.sftp_bind_port
-                    new_sftp_addr = new_settings.sftp_bind_address
-
-                    curr_sftp = app.extensions.get("sftp_server")
-                    if curr_sftp and hasattr(curr_sftp, "rebind") and (curr_sftp.port != new_sftp_port or curr_sftp.host != new_sftp_addr):
-                        logger.info(
-                            "SFTP configuration changed (%s:%d -> %s:%d); rebinding SFTP listener...",
-                            curr_sftp.host,
-                            curr_sftp.port,
-                            new_sftp_addr,
-                            new_sftp_port,
-                        )
-                        curr_sftp.rebind(new_sftp_addr, new_sftp_port)
-                        app.config["SFTP_BIND_PORT"] = new_sftp_port
-                        app.config["SFTP_BIND_ADDRESS"] = new_sftp_addr
-
-                    app.config["UPLOAD_LIMIT"] = new_settings.upload_limit
-            except Exception as err:
-                logger.debug("Config watcher error: %s", err)
-
-    import threading
-    threading.Thread(target=_config_watcher, daemon=True, name="pywings-config-watcher").start()
-
-    @app.before_request
-    def record_request_start():
-        request._wings_start_time = time.monotonic()
-
-    @app.after_request
-    def add_cors_headers(response):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        response.headers["X-Request-ID"] = request_id
-        origin = request.headers.get("Origin")
-        panel_location = app.config["PANEL_LOCATION"]
-        allowed_origin = panel_location
-        if origin and (origin == panel_location or panel_location == "*"):
-            allowed_origin = origin
-        if allowed_origin:
-            response.headers["Access-Control-Allow-Origin"] = allowed_origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = (
-            "Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, "
-            "Content-Length, Origin, X-Real-IP, X-CSRF-Token"
-        )
-        response.headers["Access-Control-Max-Age"] = "7200"
-        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
-
-        # Log incoming HTTP requests
-        start_time = getattr(request, "_wings_start_time", None)
-        latency = (time.monotonic() - start_time) * 1000 if start_time else 0.0
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-        http_logger.info(
-            "%s %s -> %s (%.2fms) [ip:%s]",
-            request.method,
-            request.path,
-            response.status_code,
-            latency,
-            client_ip,
-        )
-        return response
-
-    @app.errorhandler(404)
-    def not_found(_error):
-        # Gin's default response used by Wings for an unknown route.
-        return "404 page not found\n", 404, {"Content-Type": "text/plain; charset=utf-8"}
-
-    @app.errorhandler(413)
-    def request_too_large(_error):
-        return {"error": "The uploaded file exceeds the configured upload limit."}, 413
-
-    @app.errorhandler(400)
-    def bad_request(_error):
-        return {"error": "The request could not be understood."}, 400
-
-    @app.errorhandler(500)
-    def internal_error(_error):
-        return {"error": "An unexpected error was encountered while processing this request."}, 500
-
-    from wings.api import api
-    from wings.api import register_websocket
-
-    app.register_blueprint(api)
-    register_websocket(sock)
-    return app
+            logger.debug("Failed bridging stream %s to 127.0.0.1:%d: %s", stream_id, target_port, err)
