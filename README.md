@@ -64,3 +64,4 @@ gunicorn -w 1 -k gthread --threads 10 -b 0.0.0.0:8080 wsgi:app
 
 This project is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See the [LICENSE](LICENSE) file for the full license text.
 
+kutas
